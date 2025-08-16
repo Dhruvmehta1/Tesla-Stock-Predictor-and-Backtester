@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.DS_Store
+.ropeproject
+**/.ropeproject
+.ropeproject
+debug/
+evaluation/
+utils/

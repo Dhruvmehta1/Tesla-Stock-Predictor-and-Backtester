@@ -1,0 +1,12 @@
+tesla_stock_predictor/requirements.txt
+```
+pandas
+numpy
+scikit-learn
+lightgbm
+optuna
+python-dotenv
+requests
+joblib
+imbalanced-learn
+matplotlib
