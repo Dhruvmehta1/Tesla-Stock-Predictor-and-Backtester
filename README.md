@@ -4,7 +4,7 @@ A machine learning project for predicting TSLA stock movements, developed entire
 
 ## Project Status & Philosophy
 
-This project is a living record of my journey building a machine learning pipeline for Tesla stock prediction.  
+This project is a living record of my journey building a machine learning pipeline for Tesla stock prediction.
 All results, features, and methods are subject to change as I learn, experiment, and improve the system.
 
 - **Metrics shown in this repository are for illustration only and may not reflect future or out-of-sample performance.**
@@ -31,7 +31,7 @@ All results, features, and methods are subject to change as I learn, experiment,
 
 ## Latest Discovery: Simulating Intraday Trades with Only Daily Data
 
-- **Workaround for No Intraday Data:**  
+- **Workaround for No Intraday Data:**
   - Our biggest breakthrough was finding a way around the limitation of not having access to real intraday data. By using just the open and close prices, we cleverly simulated intraday price movement: if the SL or TP was between the open and close, we assumed it was crossed during the day and executed the sell at that level. This let us realistically apply and test stop-loss and take-profit strategies, even with only daily data.
   - **Limitation:** If both the stop-loss (SL) and take-profit (TP) are hit on the same day, we always sell at the TP. In reality, the SL could be hit before the TP, but with only daily data, we can't know which came first. We acknowledge this limitation in our backtest results.
   - **Realistic Results:** After enforcing one trade per day and robust SL/TP logic, the equity curve became much smoother and more realistic, and the Sharpe ratio dropped to a plausible level (around 2). This demonstrates the importance of matching trading logic to data frequency and realistic execution constraints.
@@ -73,16 +73,16 @@ To recover performance, we reverted to our classic feature set—restoring missi
 - Discussed and clarified the intended trading rules: always sell at open if gapped through SL/TP, otherwise sell at SL/TP if crossed intraday.
 
 ### The Fixes We Implemented
-- **SL/TP Logic:**  
+- **SL/TP Logic:**
   - Sell at open if `open_price >= tp` (for TP) or `open_price <= sl` (for SL).
   - Sell at TP/SL if crossed intraday: `min(open_price, close_price) <= tp/sl <= max(open_price, close_price)`.
-- **Removed Trailing/Partial Logic:**  
+- **Removed Trailing/Partial Logic:**
   - Simplified to full exits only, for clarity and reliability.
-- **State Management:**  
+- **State Management:**
   - After any sell, reset all trade state variables (`shares`, `position`, `last_buy_price`, `sl`, `tp`, etc.).
-- **Guard Clauses:**  
+- **Guard Clauses:**
   - Checked for `None` before using variables in arithmetic to prevent runtime errors.
-- **Trade Log Verification:**  
+- **Trade Log Verification:**
   - Used the trade log to confirm that every exit was recorded and shares were reset to zero after a sell.
 
 ### What We Learned
@@ -131,7 +131,7 @@ python -m tesla_stock_predictor.main
 ## Development Process
 - Started: April 2025
 - Method: 100% AI pair programming (ChatGPT, Claude, GitHub Copilot)
-- Evolution: 
+- Evolution:
   - Initially included LSTM and MLP (removed)
   - XGBoost tested and removed
   - Final architecture: RF, DT, LightGBM ensemble
@@ -144,22 +144,22 @@ See [STORY.md](STORY.md) for a narrative of the development journey, and [DOCUME
 
 ### Recent Major Fixes
 
-- **Non-comparable results and historical trade changes:**  
-  All sources of non-comparable results were identified and fixed. This included ensuring that feature engineering, model training, and trade logging only process new/unseen data and never recalculate historical trades unless the underlying data changes.  
+- **Non-comparable results and historical trade changes:**
+  All sources of non-comparable results were identified and fixed. This included ensuring that feature engineering, model training, and trade logging only process new/unseen data and never recalculate historical trades unless the underlying data changes.
   - The ensemble prediction and trade log are now strictly causal and append-only for new days.
   - Data fetching from Polygon.io was not the root cause; the main issues were internal pipeline logic and cache handling.
   - Data hash tracking and snapshotting now provide clear evidence if the underlying data changes, so you can distinguish between data and code issues.
-- **Trade log improvements:**  
+- **Trade log improvements:**
   The unified backtest now saves all trades (including "HOLD" days) to `debug/trade_log.csv`, while only the last 10 trades are printed in the terminal for clarity.
-- **Reproducibility:**  
+- **Reproducibility:**
   If you use cached data, your results are fully reproducible. Historical trades only change if the underlying data itself changes.
 
 ### Retraining Instructions
 
-- **To retrain the grid search for ensemble thresholds:**  
+- **To retrain the grid search for ensemble thresholds:**
   Empty the relevant `ensemble_config_*.json` file(s) in the `models/` directory. This will force the pipeline to rerun the grid search and generate new ensemble configurations.
 
-- **To fully retrain the models and regenerate all features:**  
+- **To fully retrain the models and regenerate all features:**
   Delete the feature cache (`features/features_cache.csv`), model cache files in `models/daily_models/`, and any other relevant cache files. This will force the pipeline to recompute all features and retrain all models from scratch.
 
 ## Technical Documentation
@@ -168,14 +168,14 @@ See [STORY.md](STORY.md) for a narrative of the development journey, and [DOCUME
 
 ## License
 
-This project is licensed under a custom **Educational Non-Commercial License** (see [LICENSE](LICENSE)).  
+This project is licensed under a custom **Educational Non-Commercial License** (see [LICENSE](LICENSE)).
 - **You may use, modify, and contribute to this project for educational and non-commercial purposes only.**
 - **Commercial use, selling, sublicensing, or rebranding is strictly prohibited without explicit permission.**
 - **Attribution to the original author (Dhruv Mehta) is required.**
 
 ## Disclaimer
 
-This project is provided for educational purposes only.  
+This project is provided for educational purposes only.
 **No warranty is given. The author is not liable for any damages, including financial losses incurred from trading or investment decisions made using this project. Use at your own risk.**
 
 ## Acknowledgments
