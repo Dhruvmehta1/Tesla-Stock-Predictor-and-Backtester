@@ -936,7 +936,7 @@ def main():
     try:
         import matplotlib.pyplot as plt
         plt.figure(figsize=(12, 6))
-        plt.plot(test_dates[:len(portfolio)], portfolio, label="Equity Curve", color="blue")
+        plt.plot(test_dates, portfolio[1:], label="Equity Curve", color="blue")
         plt.title("Equity Curve (Test Set)")
         plt.xlabel("Date")
         plt.ylabel("Portfolio Value ($)")
