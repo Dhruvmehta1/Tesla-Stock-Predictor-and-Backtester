@@ -368,10 +368,13 @@ def main():
             json.dump(config_to_save, f)
         print(f"Saved new ensemble config to {ensemble_config_path}")
 
+    # Normalize all dates to date only (no time) for robust comparison
+    trade_log_dates = set(pd.to_datetime(trade_log_df["Date"]).normalize()) if not trade_log_df.empty else set()
+
     for i, date in enumerate(test_dates):
-        # Only process dates not already present in the trade log
-        if not trade_log_df.empty and pd.to_datetime(date) in set(pd.to_datetime(trade_log_df["Date"])):
-            continue
+        date_norm = pd.to_datetime(date).normalize()
+        if date_norm in trade_log_dates:
+            continue  # Already processed
 
         # Use all train data up to yesterday
         train_mask = (X_train_full.index < date)
