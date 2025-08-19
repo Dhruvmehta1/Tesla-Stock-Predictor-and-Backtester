@@ -984,23 +984,27 @@ def main():
     print("\n📊 Last 10 Test Predictions vs Actual (Actual_Movement = today's close vs previous day's close):")
     print(recent_df.to_string(index=False))
 
-    try:
-        prediction = predictor.predict_tomorrow(df)
-        if prediction is not None:
-            # --- Print Tomorrow's Prediction ---
-            print("\n🔮 Tomorrow's Prediction:")
-            print(f"Date: {prediction['date'].strftime('%Y-%m-%d')}")
-            print(f"Signal: {prediction['signal']}")
-            print(f"Probability: {prediction['probability']:.4f}")
-            print(f"Confidence: {prediction['confidence']:.4f}")
-            print("Individual model probabilities:")
-            for model, prob in prediction['individual_models'].items():
-                print(f"  {model.upper()}: {prob:.4f}")
-        else:
-            print("\n🔮 Tomorrow's Prediction: No prediction needed (data for next day already exists).")
-    except Exception as e:
-        logging.error(f"Error during tomorrow's prediction: {e}")
-        logging.error(traceback.format_exc())
+    # Only run tomorrow's prediction if explicitly requested (e.g., via an environment variable or CLI flag)
+    if os.environ.get("RUN_TOMORROW_PREDICTION", "0") == "1":
+        try:
+            prediction = predictor.predict_tomorrow(df)
+            if prediction is not None:
+                # --- Print Tomorrow's Prediction ---
+                print("\n🔮 Tomorrow's Prediction:")
+                print(f"Date: {prediction['date'].strftime('%Y-%m-%d')}")
+                print(f"Signal: {prediction['signal']}")
+                print(f"Probability: {prediction['probability']:.4f}")
+                print(f"Confidence: {prediction['confidence']:.4f}")
+                print("Individual model probabilities:")
+                for model, prob in prediction['individual_models'].items():
+                    print(f"  {model.upper()}: {prob:.4f}")
+            else:
+                print("\n🔮 Tomorrow's Prediction: No prediction needed (data for next day already exists).")
+        except Exception as e:
+            logging.error(f"Error during tomorrow's prediction: {e}")
+            logging.error(traceback.format_exc())
+    else:
+        print("\n🔮 Tomorrow's Prediction: Skipped (only run in live mode or when explicitly requested).")
 
 if __name__ == "__main__":
     main()
