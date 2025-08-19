@@ -169,9 +169,12 @@ def predict_tomorrow(self, df):
     next_day = last_date + timedelta(days=1)
     while next_day.weekday() >= 5:
         next_day += timedelta(days=1)
-    # Only predict for the next day if you don't already have data for it
-    if next_day in df.index:
-        raise ValueError(f"Data for {next_day.date()} already exists. No prediction needed.")
+    # Normalize both for robust comparison
+    df_dates = pd.to_datetime(df.index).normalize()
+    next_day_norm = pd.to_datetime(next_day).normalize()
+    if next_day_norm in df_dates.values:
+        print(f"Data for {next_day.date()} already exists. No prediction needed.")
+        return None
     # Generate features for the next trading day using only data up to the last available date
     next_features = generate_features_for_next_day(df)
     latest_scaled = self.scaler.transform(next_features)
