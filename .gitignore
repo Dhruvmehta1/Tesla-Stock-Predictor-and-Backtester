@@ -8,3 +8,7 @@ __pycache__/
 debug/
 evaluation/
 utils/
+*.joblib
+*.pkl
+**/*.joblib
+**/*.pkl

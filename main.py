@@ -198,18 +198,32 @@ def main():
 
     # Use incremental feature engineering with cache
     from tesla_stock_predictor.features.engineering import engineer_features_incremental
-    df = engineer_features_incremental(df)
+    features = engineer_features_incremental(df)
+    # Defensive check: print engineered features shape and columns
+    if features.empty or len(features.columns) == 0:
+        raise ValueError("Feature engineering failed: no features generated. Check raw data and feature engineering logic.")
+
+    # Add price columns to features if not already present
+    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        if col in df.columns and col not in features.columns:
+            features[col] = df[col]
+    df = features
+
     # Save engineered features for debug inspection
     df.to_csv("tesla_stock_predictor/debug/features_latest.csv")
-    df = predictor.create_targets(df)
 
-    # Remove rows with NaN targets (last few rows)
+    # Target creation and cleaning
+    df = predictor.create_targets(df)
     df_clean = df.dropna(subset=['Target_1d']).copy()
 
-    # Use all available data for feature selection
-    predictor.select_features(df_clean)
+    # Feature selection
+    feature_df = predictor.select_features(df_clean)
+    if feature_df.shape[1] == 0:
+        print("WARNING: No features selected! Columns in df_clean:", df_clean.columns.tolist())
+        print("df_clean head:\n", df_clean.head())
+        raise ValueError("Feature selection failed: no features selected. Check feature engineering and selection logic.")
 
-    X = df_clean[predictor.feature_names].copy()
+    X = feature_df.copy()
     X = X.fillna(method='ffill').fillna(0)
     y = df_clean['Target_1d']
 
@@ -238,6 +252,8 @@ def main():
     X_test = X.loc[test_mask]
     y_test = y.loc[test_mask]
 
+
+
     # Fit scaler on full training data and transform validation set before loop
     scaler = StandardScaler()
     scaler.fit(X_train_full)
@@ -245,15 +261,7 @@ def main():
     X_test_scaled = scaler.transform(X_test)
     predictor.scaler = scaler  # Ensure scaler is available for tomorrow's prediction
 
-    print(f"Fixed date split:")
-    print(f"Train: {X_train_full.index.min()} to {X_train_full.index.max()} ({len(X_train_full)} samples)")
-    print(f"Val: {X_val.index.min()} to {X_val.index.max()} ({len(X_val)} samples)")
-    print(f"Test: {X_test.index.min()} to {X_test.index.max()} ({len(X_test)} samples)")
 
-    # Print class distributions for debugging
-    print("Train class distribution:", np.bincount(y_train_full))
-    print("Validation class distribution:", np.bincount(y_val))
-    print("Test class distribution:", np.bincount(y_test))
 
     # Prepare test dates for incremental walk-forward
     test_dates = X_test.index.sort_values()
@@ -392,7 +400,13 @@ def main():
         os.makedirs(scaler_cache_dir, exist_ok=True)
         scaler_path = os.path.join(scaler_cache_dir, f"scaler_{date}.joblib")
         if os.path.exists(scaler_path):
-            scaler = load(scaler_path)
+            try:
+                scaler = load(scaler_path)
+            except Exception as e:
+                print(f"Scaler cache for {date} is corrupted or incompatible. Recomputing. Error: {e}")
+                scaler = StandardScaler()
+                scaler.fit(X_train_balanced)
+                dump(scaler, scaler_path)
         else:
             scaler = StandardScaler()
             scaler.fit(X_train_balanced)
@@ -406,14 +420,11 @@ def main():
         for model_name in ['rf', 'lr', 'dt', 'lgb', 'gb']:
             model_path = os.path.join(model_cache_dir, f"{model_name}_model_{date}.joblib")
             if os.path.exists(model_path):
-                predictor.models[model_name] = load(model_path)
-            else:
-                # Train and save model if not cached
-                if model_name in predictor.models:
-                    model = predictor.models[model_name]
-                else:
-                    # Use best params from cache
-                    from joblib import dump
+                try:
+                    predictor.models[model_name] = load(model_path)
+                except Exception as e:
+                    print(f"Model cache for {model_name} on {date} is corrupted or incompatible. Recomputing. Error: {e}")
+                    # Train and save model if not cached or cache is bad
                     best_params_path = "tesla_stock_predictor/models/best_params.json"
                     with open(best_params_path, "r") as f:
                         best_params = json.load(f)
@@ -436,6 +447,32 @@ def main():
                     else:
                         continue
                     model.fit(X_train_scaled, y_train_balanced)
+                    dump(model, model_path)
+                    predictor.models[model_name] = model
+            else:
+                # Train and save model if not cached
+                best_params_path = "tesla_stock_predictor/models/best_params.json"
+                with open(best_params_path, "r") as f:
+                    best_params = json.load(f)
+                params = best_params.get(model_name, {})
+                if model_name == 'rf':
+                    from sklearn.ensemble import RandomForestClassifier
+                    model = RandomForestClassifier(**params)
+                elif model_name == 'gb':
+                    from sklearn.ensemble import GradientBoostingClassifier
+                    model = GradientBoostingClassifier(**params)
+                elif model_name == 'lr':
+                    from sklearn.linear_model import LogisticRegression
+                    model = LogisticRegression(**params)
+                elif model_name == 'dt':
+                    from sklearn.tree import DecisionTreeClassifier
+                    model = DecisionTreeClassifier(**params)
+                elif model_name == 'lgb':
+                    import lightgbm as lgb
+                    model = lgb.LGBMClassifier(**params)
+                else:
+                    continue
+                model.fit(X_train_scaled, y_train_balanced)
                 dump(model, model_path)
                 predictor.models[model_name] = model
 
