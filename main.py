@@ -369,8 +369,8 @@ def main():
         print(f"Saved new ensemble config to {ensemble_config_path}")
 
     for i, date in enumerate(test_dates):
-        # Only process new dates (not already logged)
-        if last_logged_date is not None and pd.to_datetime(date) <= last_logged_date:
+        # Only process dates not already present in the trade log
+        if not trade_log_df.empty and pd.to_datetime(date) in set(pd.to_datetime(trade_log_df["Date"])):
             continue
 
         # Use all train data up to yesterday
