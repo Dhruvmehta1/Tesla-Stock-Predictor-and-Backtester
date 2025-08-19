@@ -160,22 +160,17 @@ def grid_search_model_thresholds(
     best = results[0]
     return best
 
+from tesla_stock_predictor.features.engineering import generate_features_for_next_day
+
 def predict_tomorrow(self, df):
     """Generate tomorrow's prediction with detailed analysis"""
-    # Get features for the last available day
-    features_df = self.select_features(df)
-    latest_features = features_df.iloc[-1:].copy()
-
-    # Scale features using the same scaler used during training
-    latest_scaled = self.scaler.transform(latest_features)
-
+    # Generate features for the next trading day using only data up to the last available date
+    next_features = generate_features_for_next_day(df)
+    latest_scaled = self.scaler.transform(next_features)
     pred, prob, conf, indiv_preds, indiv_probs = self.ensemble_predict(latest_scaled)
 
-    # Calculate next trading day
-    last_date = df.index[-1]
-    next_day = last_date + timedelta(days=1)
-    while next_day.weekday() >= 5:  # Skip weekends
-        next_day += timedelta(days=1)
+    # The next trading day date
+    next_day = next_features.index[0]
 
     # Generate signal
     if prob[0] > 0.65:

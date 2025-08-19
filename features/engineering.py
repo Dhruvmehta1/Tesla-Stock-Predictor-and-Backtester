@@ -2,9 +2,6 @@ import numpy as np
 import pandas as pd
 import os
 
-import numpy as np
-import pandas as pd
-
 def supertrend(df, atr_period=10, factor=3.0):
     """
     Calculate Supertrend indicator.
@@ -87,6 +84,30 @@ def engineer_features_incremental(df, sector_df=None, spy_df=None):
             cached.to_csv(cache_path)
 
     return cached
+
+def generate_features_for_next_day(df, sector_df=None, spy_df=None):
+    """
+    Generate features for the next trading day using only data up to the last available date.
+    Returns a DataFrame with a single row for the next trading day.
+    """
+    # Find the next business day (or trading day)
+    last_date = df.index[-1]
+    next_day = last_date + pd.Timedelta(days=1)
+    while next_day.weekday() >= 5:  # Skip weekends
+        next_day += pd.Timedelta(days=1)
+
+    # Create a new DataFrame with the next day as index, copying the last row's data
+    next_row = df.iloc[[-1]].copy()
+    next_row.index = [next_day]
+
+    # Concatenate to simulate the new day for rolling features
+    df_extended = pd.concat([df, next_row])
+
+    # Recompute features for the extended DataFrame
+    features_df = engineer_features(df_extended, sector_df=sector_df, spy_df=spy_df)
+
+    # Return only the last row (the next day)
+    return features_df.iloc[[-1]]
 
     # Create a copy to avoid modifying original
     df = df.copy()
