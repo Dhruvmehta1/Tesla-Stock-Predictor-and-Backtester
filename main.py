@@ -575,7 +575,7 @@ def main():
     max_drawdown = 0
     peak = capital
 
-    for i in range(len(test_pred)-1):
+    for i in range(len(test_pred)):
         date = test_dates[i]
         open_price = df_clean.loc[date, 'Open']
         close_price = df_clean.loc[date, 'Close']
