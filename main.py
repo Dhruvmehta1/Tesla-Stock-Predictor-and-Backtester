@@ -986,15 +986,18 @@ def main():
 
     try:
         prediction = predictor.predict_tomorrow(df)
-        # --- Print Tomorrow's Prediction ---
-        print("\n🔮 Tomorrow's Prediction:")
-        print(f"Date: {prediction['date'].strftime('%Y-%m-%d')}")
-        print(f"Signal: {prediction['signal']}")
-        print(f"Probability: {prediction['probability']:.4f}")
-        print(f"Confidence: {prediction['confidence']:.4f}")
-        print("Individual model probabilities:")
-        for model, prob in prediction['individual_models'].items():
-            print(f"  {model.upper()}: {prob:.4f}")
+        if prediction is not None:
+            # --- Print Tomorrow's Prediction ---
+            print("\n🔮 Tomorrow's Prediction:")
+            print(f"Date: {prediction['date'].strftime('%Y-%m-%d')}")
+            print(f"Signal: {prediction['signal']}")
+            print(f"Probability: {prediction['probability']:.4f}")
+            print(f"Confidence: {prediction['confidence']:.4f}")
+            print("Individual model probabilities:")
+            for model, prob in prediction['individual_models'].items():
+                print(f"  {model.upper()}: {prob:.4f}")
+        else:
+            print("\n🔮 Tomorrow's Prediction: No prediction needed (data for next day already exists).")
     except Exception as e:
         logging.error(f"Error during tomorrow's prediction: {e}")
         logging.error(traceback.format_exc())

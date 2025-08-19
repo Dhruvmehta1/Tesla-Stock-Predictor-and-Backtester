@@ -164,13 +164,18 @@ from tesla_stock_predictor.features.engineering import generate_features_for_nex
 
 def predict_tomorrow(self, df):
     """Generate tomorrow's prediction with detailed analysis"""
+    # Find the next business day (or trading day)
+    last_date = df.index[-1]
+    next_day = last_date + timedelta(days=1)
+    while next_day.weekday() >= 5:
+        next_day += timedelta(days=1)
+    # Only predict for the next day if you don't already have data for it
+    if next_day in df.index:
+        raise ValueError(f"Data for {next_day.date()} already exists. No prediction needed.")
     # Generate features for the next trading day using only data up to the last available date
     next_features = generate_features_for_next_day(df)
     latest_scaled = self.scaler.transform(next_features)
     pred, prob, conf, indiv_preds, indiv_probs = self.ensemble_predict(latest_scaled)
-
-    # The next trading day date
-    next_day = next_features.index[0]
 
     # Generate signal
     if prob[0] > 0.65:
