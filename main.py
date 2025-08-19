@@ -369,7 +369,7 @@ def main():
         print(f"Saved new ensemble config to {ensemble_config_path}")
 
     # Normalize all dates to date only (no time) for robust comparison
-    trade_log_dates = set(pd.to_datetime(trade_log_df["Date"]).normalize()) if not trade_log_df.empty else set()
+    trade_log_dates = set(pd.to_datetime(trade_log_df["Date"]).dt.normalize()) if not trade_log_df.empty else set()
 
     for i, date in enumerate(test_dates):
         date_norm = pd.to_datetime(date).normalize()
