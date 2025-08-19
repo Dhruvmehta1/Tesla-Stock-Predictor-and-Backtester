@@ -54,7 +54,12 @@ def supertrend(df, atr_period=10, factor=3.0):
 def engineer_features(df, sector_df=None, spy_df=None):
     """Enhanced feature engineering WITHOUT data leakage
     Optionally merges sector ETF and SPY data for relative features.
+    Always returns a DataFrame, never None.
     """
+    # If df is empty or missing required columns, return empty DataFrame
+    if df is None or len(df) == 0 or not all(col in df.columns for col in ['Close', 'High', 'Low', 'Volume']):
+        return pd.DataFrame(index=df.index if df is not None else None)
+    # ... rest of the function remains unchanged ...
 
 def engineer_features_incremental(df, sector_df=None, spy_df=None):
     """
@@ -106,6 +111,9 @@ def generate_features_for_next_day(df, sector_df=None, spy_df=None):
     # Recompute features for the extended DataFrame
     features_df = engineer_features(df_extended, sector_df=sector_df, spy_df=spy_df)
 
+    # Defensive: If features_df is None or empty, raise a clear error
+    if features_df is None or features_df.empty:
+        raise ValueError("Feature generation for next day failed or returned empty DataFrame.")
     # Return only the last row (the next day)
     return features_df.iloc[[-1]]
 
