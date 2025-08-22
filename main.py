@@ -277,8 +277,33 @@ def main():
     if feature_df_train.shape[1] == 0:
         raise ValueError("Feature selection failed: no features selected.")
 
+    # Filter out problematic features early in the pipeline
+    problematic_features = [
+        'Close_to_High', 'Close_to_Low',
+        'Body_size', 'Upper_shadow', 'Lower_shadow',
+        'BB_position', 'BB_squeeze', 'BB_Width',
+        'High_Low_ratio', 'OBV',
+        'Volume_ratio', 'Volume_Shadow', 'Volume_trend',
+        'Trend_strength', 'ATR_vs_BodySize'
+    ]
+
+    cols_to_drop = [col for col in feature_df_train.columns
+                   if any(feat in col for feat in problematic_features)]
+
+    if cols_to_drop:
+        print(f"\n=== REMOVING {len(cols_to_drop)} PROBLEMATIC FEATURES DURING SELECTION ===")
+        for col in cols_to_drop[:10]:
+            print(f"  - {col}")
+        if len(cols_to_drop) > 10:
+            print(f"  - ... and {len(cols_to_drop) - 10} more")
+
+        feature_df_train = feature_df_train.drop(columns=cols_to_drop)
+        print(f"Remaining features after removal: {feature_df_train.shape[1]}")
+
     # Use the same selected features for the entire dataset
+    # These features have already had problematic ones removed
     selected_features = feature_df_train.columns
+    print(f"Using {len(selected_features)} selected features (after removing problematic ones)")
     feature_df = df_clean[selected_features]
 
     # Create feature matrix and target
@@ -339,7 +364,28 @@ def main():
     corr_with_target = []
     high_corr_features = []
     suspicious_features = []
+
+    # Problematic features to exclude - these might be causing unrealistic performance
+    problematic_features = [
+        'Close_to_High', 'Close_to_Low',
+        'Body_size', 'Upper_shadow', 'Lower_shadow',
+        'BB_position', 'BB_squeeze', 'BB_Width',
+        'High_Low_ratio', 'OBV',
+        # Add more potentially problematic features
+        'Volume_ratio', 'Volume_Shadow', 'Volume_trend',
+        'Trend_strength', 'ATR_vs_BodySize'
+    ]
+
+    print(f"\n=== REMOVING POTENTIALLY PROBLEMATIC FEATURES ===")
+    print(f"Excluding these features that might cause unrealistic performance: {problematic_features}")
+
     for col in X_test.columns:
+        # Skip problematic features
+        if any(feat in col for feat in problematic_features):
+            print(f"Excluding feature: {col}")
+            suspicious_features.append(col)
+            continue
+
         try:
             # Use Spearman correlation which is more robust
             from scipy.stats import spearmanr
@@ -428,11 +474,39 @@ def main():
     X_val = X_val[keep]
     X_test = X_test[keep]
 
-    # Drop all-zero columns in any split
+    # Drop all-zero columns and problematic features in any split
     def drop_all_zero_columns(*dfs):
         cols_to_drop = set()
+
+        # Problematic features to exclude - these might be causing unrealistic performance
+        problematic_features = [
+            'Close_to_High', 'Close_to_Low',
+            'Body_size', 'Upper_shadow', 'Lower_shadow',
+            'BB_position', 'BB_squeeze', 'BB_Width',
+            'High_Low_ratio', 'OBV',
+            'Volume_ratio', 'Volume_Shadow', 'Volume_trend',
+            'Trend_strength', 'ATR_vs_BodySize'
+        ]
+
+        # Add problematic features to drop list
+        for df in dfs:
+            for col in df.columns:
+                if any(feat in col for feat in problematic_features):
+                    cols_to_drop.add(col)
+
+        # Add all-zero columns to drop list
         for df in dfs:
             cols_to_drop |= set(df.columns[(df == 0).all()])
+
+        # Print actual dropped feature names for verification
+        problematic_dropped = [col for col in cols_to_drop if any(feat in col for feat in problematic_features)]
+        other_dropped = [col for col in cols_to_drop if not any(feat in col for feat in problematic_features)]
+
+        print(f"=== FEATURE REMOVAL VERIFICATION ===")
+        print(f"Dropping {len(problematic_dropped)} problematic features:")
+        for feat in problematic_dropped:
+            print(f"  - {feat}")
+        print(f"Dropping {len(other_dropped)} other columns (all zeros, etc.)")
         for df in dfs:
             df.drop(columns=list(cols_to_drop), inplace=True, errors='ignore')
         return dfs
@@ -465,6 +539,23 @@ def main():
             for feat in feature_names:
                 f.write(f"{feat}\n")
         print(f"Saved list of {len(feature_names)} selected features to {features_file}")
+
+        # Verify problematic features were actually removed
+        problematic_features = [
+            'Close_to_High', 'Close_to_Low',
+            'Body_size', 'Upper_shadow', 'Lower_shadow',
+            'BB_position', 'BB_squeeze', 'BB_Width',
+            'High_Low_ratio', 'OBV',
+            'Volume_ratio', 'Volume_Shadow', 'Volume_trend',
+            'Trend_strength', 'ATR_vs_BodySize'
+        ]
+        remaining_problematic = [feat for feat in feature_names if any(problem in feat for problem in problematic_features)]
+        if remaining_problematic:
+            print(f"WARNING: Some problematic features are still present after filtering:")
+            for feat in remaining_problematic:
+                print(f"  - {feat}")
+        else:
+            print(f"SUCCESS: All problematic features have been removed")
     except Exception as e:
         print(f"Error saving feature list: {e}")
     X_train_full = scaler.transform(X_train_full)
@@ -472,10 +563,21 @@ def main():
     X_test = scaler.transform(X_test)
     predictor.scaler = scaler  # Ensure scaler is available for tomorrow's prediction
 
-    # Convert back to DataFrame with correct indices and columns
-    X_train_full = pd.DataFrame(X_train_full, index=train_index, columns=keep)
-    X_val = pd.DataFrame(X_val, index=val_index, columns=keep)
-    X_test = pd.DataFrame(X_test, index=test_index, columns=keep)
+    # Create robust column names for our scaled data
+    print(f"Handling DataFrame conversion with proper column alignment...")
+    print(f"X_train_full shape: {X_train_full.shape}, keep length: {len(keep)}")
+
+    # After scaling, we need to ensure column names are correctly aligned
+    # Create generic column names based on actual column count
+    generic_columns = [f"feature_{i}" for i in range(X_train_full.shape[1])]
+
+    # Convert arrays to DataFrames with indices
+    X_train_full = pd.DataFrame(X_train_full, index=train_index, columns=generic_columns)
+    X_val = pd.DataFrame(X_val, index=val_index, columns=generic_columns[:X_val.shape[1]])
+    X_test = pd.DataFrame(X_test, index=test_index, columns=generic_columns[:X_test.shape[1]])
+
+    print(f"Successfully converted arrays to DataFrames with proper column counts")
+    print(f"Final shapes - X_train: {X_train_full.shape}, X_val: {X_val.shape}, X_test: {X_test.shape}")
 
     # === DIAGNOSTICS: Print test feature statistics before prediction ===
 
