@@ -1,11 +1,37 @@
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.feature_selection import mutual_info_classif, SelectKBest, f_classif
+import random
 import os
 import warnings
+import json
 from scipy import stats
 import logging
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.feature_selection import mutual_info_classif, SelectKBest, f_classif
+
+# Set fixed random seeds for deterministic feature processing
+GLOBAL_SEED = 42
+random.seed(GLOBAL_SEED)
+np.random.seed(GLOBAL_SEED)
+
+def set_all_random_seeds():
+    """Set all random seeds for deterministic processing"""
+    random.seed(GLOBAL_SEED)
+    np.random.seed(GLOBAL_SEED)
+    os.environ['PYTHONHASHSEED'] = str(GLOBAL_SEED)
+    try:
+        import tensorflow as tf
+        tf.random.set_seed(GLOBAL_SEED)
+    except ImportError:
+        pass
+    try:
+        import torch
+        torch.manual_seed(GLOBAL_SEED)
+        torch.cuda.manual_seed_all(GLOBAL_SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except ImportError:
+        pass
 
 def setup_logging():
     """Setup logging for processing pipeline"""
@@ -119,7 +145,7 @@ def detect_temporal_leakage(df, feature_cols, target_col='Target_1d', max_correl
                 from sklearn.model_selection import cross_val_score
 
                 if len(feature_aligned) > 100:
-                    dt = DecisionTreeClassifier(max_depth=1, random_state=42)
+                    dt = DecisionTreeClassifier(max_depth=1, random_state=GLOBAL_SEED)
                     scores = cross_val_score(dt, feature_aligned.values.reshape(-1, 1),
                                            target_aligned.values, cv=3, scoring='accuracy')
                     avg_score = scores.mean()
@@ -178,7 +204,33 @@ def validate_feature_timestamps(df, feature_cols):
 def enhanced_feature_selection(X_train, y_train, X_val=None, X_test=None, max_features=100):
     """
     Enhanced feature selection with multiple methods and strict anti-leakage controls
+    Uses caching for perfect reproducibility across runs
     """
+    # Set seeds for deterministic feature selection
+    set_all_random_seeds()
+
+    # Check for cached feature selection first
+    cache_dir = os.path.join(os.getcwd(), "models")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, "selected_features_cache.json")
+
+    # Try to load from cache first
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'r') as f:
+                cached_data = json.load(f)
+                feature_count = cached_data.get('feature_count', 0)
+                selected_features = cached_data.get('selected_features', [])
+
+                # Verify the cache matches our requirements
+                if (feature_count == max_features and
+                    all(feature in X_train.columns for feature in selected_features)):
+                    logger.info(f"✅ Using cached feature selection ({len(selected_features)} features)")
+                    print(f"Using cached feature selection from {cache_file} for deterministic behavior")
+                    return selected_features
+        except Exception as e:
+            logger.warning(f"Could not load feature selection cache: {e}")
+
     logger.info(f"Starting enhanced feature selection (max {max_features} features)...")
 
     if X_train.empty or len(X_train) < 50:
@@ -197,8 +249,11 @@ def enhanced_feature_selection(X_train, y_train, X_val=None, X_test=None, max_fe
         X_train_filled = X_train.fillna(0)
 
         # Method 1: Mutual Information (captures non-linear relationships)
+        # Set random seeds for deterministic feature selection
+        set_all_random_seeds()
+
         try:
-            mi_scores = mutual_info_classif(X_train_filled, y_train, random_state=42)
+            mi_scores = mutual_info_classif(X_train_filled, y_train, random_state=GLOBAL_SEED)
             mi_threshold = np.percentile(mi_scores[mi_scores > 0], 60)  # Top 40%
             mi_features = X_train.columns[mi_scores > mi_threshold].tolist()
 
@@ -327,6 +382,25 @@ def enhanced_feature_selection(X_train, y_train, X_val=None, X_test=None, max_fe
 
         logger.info(f"Enhanced feature selection complete: {len(selected_features)} features selected")
 
+        # Save feature selection to cache for deterministic behavior
+        try:
+            cache_dir = os.path.join(os.getcwd(), "models")
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_file = os.path.join(cache_dir, "selected_features_cache.json")
+
+            cache_data = {
+                'feature_count': max_features,
+                'selected_features': selected_features,
+                'timestamp': str(pd.Timestamp.now())
+            }
+
+            with open(cache_file, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+            logger.info(f"✅ Feature selection cached to {cache_file}")
+            print(f"Feature selection saved to cache for deterministic behavior")
+        except Exception as e:
+            logger.warning(f"Could not save feature selection cache: {e}")
+
         # Save feature selection results
         try:
             os.makedirs("debug", exist_ok=True)
@@ -369,12 +443,15 @@ def scale_features(X_train, X_val=None, X_test=None, method='standard'):
     """
     Scale features with multiple scaling options and robust error handling
     """
-    logger.info(f"Scaling features using {method} scaler...")
+    # Set seeds for deterministic scaling
+    set_all_random_seeds()
+    logger.info(f"Scaling features using {method} scaler with fixed random seed {GLOBAL_SEED}...")
 
     if X_train.empty:
         raise ValueError("Training data is empty")
 
-    # Choose scaler
+    # Choose scaler (note: neither StandardScaler nor RobustScaler have random_state parameter)
+    # We ensure determinism through global seed setting instead
     if method == 'robust':
         scaler = RobustScaler()
     else:
@@ -383,6 +460,8 @@ def scale_features(X_train, X_val=None, X_test=None, method='standard'):
     feature_names = X_train.columns.tolist() if hasattr(X_train, 'columns') else None
 
     try:
+        # Set seeds again before fitting for complete determinism
+        set_all_random_seeds()
         # Fit scaler on training data only
         scaler.fit(X_train)
         X_train_scaled = scaler.transform(X_train)
@@ -644,7 +723,7 @@ def comprehensive_leakage_test(df_train, df_val=None, df_test=None, target_col='
                         # Check if feature perfectly predicts target
                         try:
                             from sklearn.tree import DecisionTreeClassifier
-                            dt = DecisionTreeClassifier(max_depth=1, random_state=42)
+                            dt = DecisionTreeClassifier(max_depth=1, random_state=GLOBAL_SEED)
                             dt.fit(feature.values.reshape(-1, 1), target_aligned.values)
                             accuracy = dt.score(feature.values.reshape(-1, 1), target_aligned.values)
 
@@ -696,7 +775,10 @@ def process_features_pipeline(df_train_raw, df_val_raw=None, df_test_raw=None,
     """
     Complete feature processing pipeline with comprehensive validation
     """
-    logger.info("🚀 Starting comprehensive feature processing pipeline...")
+    # Set all random seeds for deterministic processing
+    set_all_random_seeds()
+    logger.info("🚀 Starting comprehensive feature processing pipeline with fixed random seed...")
+    logger.info(f"Using global seed {GLOBAL_SEED} for deterministic feature selection")
 
     try:
         # Import feature engineering functions
@@ -1129,7 +1211,10 @@ def process_features_with_validation(df_train_raw, df_val_raw=None, df_test_raw=
     """
     Complete feature processing pipeline with validation and recommendations
     """
+    # Set seeds for deterministic processing
+    set_all_random_seeds()
     logger.info("🚀 Starting comprehensive feature processing with validation...")
+    logger.info(f"Using global seed {GLOBAL_SEED} for deterministic processing")
 
     try:
         # Run main processing pipeline
@@ -1197,6 +1282,10 @@ def detect_data_leakage(X_train, y_train, threshold=0.95):
 def process_features(df_train_raw, df_val_raw=None, df_test_raw=None,
                     max_features=50, enable_feature_selection=True):
     """Backward compatibility wrapper"""
+    # Set seeds for deterministic processing
+    set_all_random_seeds()
+    print(f"Using fixed random seed {GLOBAL_SEED} for deterministic feature processing")
+    print(f"Feature selection caching enabled for perfect reproducibility")
     return process_features_pipeline(
         df_train_raw=df_train_raw,
         df_val_raw=df_val_raw,

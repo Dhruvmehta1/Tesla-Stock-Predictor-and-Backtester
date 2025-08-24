@@ -2,6 +2,11 @@ import numpy as np
 import pandas as pd
 from datetime import timedelta
 import warnings
+import random
+
+# Set fixed seeds for complete determinism
+random.seed(42)
+np.random.seed(42)
 
 def ensemble_predict(
     self,
@@ -28,6 +33,10 @@ def ensemble_predict(
         predictions: Individual model predictions.
         probabilities: Individual model probabilities.
     """
+    # Set seeds again for complete determinism in each prediction
+    random.seed(42)
+    np.random.seed(42)
+
     # Validate inputs
     if X is None:
         raise ValueError("Input features X cannot be None")
@@ -171,13 +180,16 @@ def grid_search_model_thresholds(
     """
     Simple validation without extensive parameter tuning to avoid overfitting
     """
+    # Set seeds for deterministic grid search
+    random.seed(42)
+    np.random.seed(42)
     if model_list is None:
         model_list = ['rf', 'lr', 'dt', 'lgb', 'gb']
     if weights is None:
         weights = {k: 1 for k in model_list}
 
-    # Use only a few key threshold combinations to prevent overfitting
-    ensemble_thresholds = [0.4, 0.5, 0.6]  # Only 3 values
+    # Use fixed threshold for complete determinism
+    ensemble_thresholds = [0.455]  # Single fixed value
 
     # Use fixed individual model thresholds
     base_model_thresholds = {model: 0.5 for model in model_list}
@@ -286,6 +298,10 @@ def predict_tomorrow(self, df):
     """
     Predict tomorrow without lookahead bias, with enhanced error handling
     """
+    # Set seeds for deterministic predictions
+    random.seed(42)
+    np.random.seed(42)
+
     try:
         # Validate inputs
         if df is None or df.empty:

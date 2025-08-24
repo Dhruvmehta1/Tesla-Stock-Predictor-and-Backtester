@@ -1,7 +1,20 @@
 import numpy as np
 import pandas as pd
 import os
+import random
 from scipy import stats
+
+# Set fixed random seeds for deterministic feature engineering
+GLOBAL_SEED = 42
+random.seed(GLOBAL_SEED)
+np.random.seed(GLOBAL_SEED)
+os.environ['PYTHONHASHSEED'] = str(GLOBAL_SEED)
+
+def set_all_random_seeds():
+    """Set all random seeds for deterministic processing"""
+    random.seed(GLOBAL_SEED)
+    np.random.seed(GLOBAL_SEED)
+    os.environ['PYTHONHASHSEED'] = str(GLOBAL_SEED)
 
 def supertrend(df, atr_period=10, factor=3.0):
     """
@@ -331,6 +344,8 @@ def create_advanced_pattern_features(df):
 
 def engineer_features(df, sector_df=None, spy_df=None):
     """Enhanced feature engineering WITHOUT data leakage - completely rewritten"""
+    # Set random seeds for deterministic feature engineering
+    set_all_random_seeds()
 
     if df is None or df.empty:
         print("ERROR: Empty or None dataframe passed to engineer_features")
@@ -859,6 +874,9 @@ def select_features(df):
     # Create feature DataFrame
     if available_features:
         try:
+            # Set seeds again before final selection for complete determinism
+            set_all_random_seeds()
+
             feature_df = df[available_features].copy()
             # Handle any remaining NaN values
             feature_df = feature_df.fillna(method='ffill').fillna(0) if hasattr(feature_df, 'fillna') else feature_df.fillna(0)
@@ -890,6 +908,8 @@ def select_features(df):
 
 def create_targets(df):
     """Create prediction targets with strict future-looking approach"""
+    # Set random seeds for deterministic target creation
+    set_all_random_seeds()
 
     if df is None or len(df) == 0:
         print("WARNING: Empty dataframe passed to create_targets")

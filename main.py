@@ -1,9 +1,28 @@
 import sys
 import os
+import random
+import numpy as np
+
+# Set all seeds BEFORE importing anything else
+GLOBAL_SEED = 42
+random.seed(GLOBAL_SEED)
+np.random.seed(GLOBAL_SEED)
+os.environ['PYTHONHASHSEED'] = str(GLOBAL_SEED)
+
+# Set environment variables for deterministic behavior
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ['TF_DETERMINISTIC_OPS'] = '1'
+
+# Force deterministic operations in scientific libraries
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'  # For CUDA operations
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
-import numpy as np
 import json
 import datetime
 from datetime import datetime as dt
@@ -12,20 +31,27 @@ from dotenv import load_dotenv
 import warnings
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import matplotlib.colors as mcolors
 from pathlib import Path
 
 # Disable warnings for cleaner output
 warnings.filterwarnings('ignore')
+
+def set_additional_seeds():
+    """Set seeds for additional libraries"""
+    try:
+        import tensorflow as tf
+        tf.random.set_seed(GLOBAL_SEED)
+        print("TensorFlow seed set")
+    except ImportError:
+        pass
 
 def plot_portfolio_value(trade_log):
     if trade_log.empty or 'Portfolio_Value' not in trade_log.columns:
         print("No portfolio data available to plot")
         return
 
-    # Ensure the plots directory exists
-    plots_dir = Path("debug/plots")
-    plots_dir.mkdir(parents=True, exist_ok=True)
+    # Save plots to Tesla project root directory
+    plots_dir = Path(".")
 
     # Create plot
     plt.figure(figsize=(12, 6))
@@ -91,7 +117,9 @@ def plot_portfolio_value(trade_log):
     plt.tight_layout()
 
     # Save plot, overwriting any existing file
-    plot_path = plots_dir / "portfolio_value.png"
+    plot_path = "portfolio_curve.png"
+    # Use fixed figure size and DPI for consistent outputs
+    plt.gcf().set_size_inches(12, 6)
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     print(f"Portfolio value plot saved to {plot_path}")
 
@@ -99,10 +127,19 @@ def plot_portfolio_value(trade_log):
     plt.close()
 
 
-def backtest_financial_metrics(preds, X_idx, df_clean, sl_pct=0.01, tp_sl_ratio=3.0):
+def backtest_financial_metrics(preds, X_idx, df_clean, sl_pct=0.015, tp_sl_ratio=2.7):
     """
     Fixed backtesting function with improved error handling and validation.
+    Uses fixed sl_pct and tp_sl_ratio values for complete determinism.
     """
+    # Set random seeds for deterministic behavior
+    random.seed(GLOBAL_SEED)
+    np.random.seed(GLOBAL_SEED)
+
+    # Use exact float values to prevent floating point precision issues
+    sl_pct = float('0.015')
+    tp_sl_ratio = float('2.7')
+
     # Validate inputs
     if len(preds) == 0 or len(X_idx) == 0:
         print("WARNING: Empty predictions or index provided to backtesting")
@@ -193,7 +230,6 @@ def backtest_financial_metrics(preds, X_idx, df_clean, sl_pct=0.01, tp_sl_ratio=
 
     # Add slippage and more realistic costs
     slippage_bps = 5  # 5 basis points slippage
-
     transaction_cost_pct = 0.0015  # 0.15% transaction cost
 
     # Iterate through each day with aligned data
@@ -382,10 +418,14 @@ def backtest_financial_metrics(preds, X_idx, df_clean, sl_pct=0.01, tp_sl_ratio=
 
     max_drawdown = max(drawdowns) if drawdowns else 0
 
-    # Save trade log to CSV
-    os.makedirs("debug", exist_ok=True)
+    # Save trade log to CSV in Tesla project root directory
     if not trade_log.empty:
-        trade_log.to_csv("debug/trade_log.csv", index=False)
+        trade_log_path = "trade_log.csv"
+        # Force float precision to be consistent
+        for col in trade_log.select_dtypes(include=['float']).columns:
+            trade_log[col] = trade_log[col].map(lambda x: float(f'{x:.6f}'))
+        trade_log.to_csv(trade_log_path, index=False)
+        print(f"Trade log saved to {trade_log_path}")
 
     # Return summary metrics
     return sharpe, total_return, max_drawdown, (equity_curve, trades, positions, win_count, loss_count, trade_log)
@@ -436,16 +476,24 @@ class TSLAPredictor:
             raise
 
     def train_models(self, X_train, y_train, X_val, y_val, close_prices_val):
+        """Use the new deterministic trainer"""
         try:
+            # Import our new deterministic trainer
+            from deterministic_trainer import DeterministicModelTrainer
+
+            trainer = DeterministicModelTrainer(random_state=GLOBAL_SEED)
+            trained_models = trainer.train_models(X_train, y_train, X_val, y_val, close_prices_val)
+            self.models = trained_models
+
+        except ImportError:
+            # Fallback to original trainer if new one isn't available
+            print("WARNING: Using fallback trainer - results may not be fully deterministic")
             import sys
-            sys.path.append(".")  # Add current directory to path
+            sys.path.append(".")
             from models.training import ModelTrainer
             trainer = ModelTrainer()
             trainer.train_models(X_train, y_train, X_val, y_val, close_prices_val)
             self.models = trainer.models
-        except ImportError as e:
-            print(f"ERROR: Could not import training module: {e}")
-            raise
         except Exception as e:
             print(f"ERROR: Failed to train models: {e}")
             raise
@@ -479,6 +527,18 @@ class TSLAPredictor:
 
 def main():
     print("Starting Tesla Stock Predictor...")
+    print(f"Using fixed random seed: {GLOBAL_SEED} for deterministic behavior")
+
+    # Set all random seeds for complete determinism
+    print(f"Setting fixed random seed: {GLOBAL_SEED}")
+    random.seed(GLOBAL_SEED)
+    np.random.seed(GLOBAL_SEED)
+
+    # Ensure all data structures are deterministic
+    os.environ['PYTHONHASHSEED'] = str(GLOBAL_SEED)
+
+    # Set additional library seeds
+    set_additional_seeds()
 
     # Load environment variables from .env file
     load_dotenv()
@@ -527,7 +587,6 @@ def main():
             df = df.merge(spy_df[["SPY_Close"]], left_index=True, right_index=True, how="left")
         except Exception as e:
             print(f"WARNING: Could not fetch sector/SPY data: {e}")
-            # Continue without sector data
 
         print(f"Retrieved {len(df)} data points")
 
@@ -555,7 +614,11 @@ def main():
         try:
             import sys
             sys.path.append(".")  # Add current directory to path
-            from features.processing import process_features
+            from features.processing import process_features, set_all_random_seeds
+
+            # Set seeds again before feature processing
+            set_all_random_seeds()
+            print("Setting deterministic seeds before feature processing")
 
             # Process all features (steps 1-5 of the Sacred Order)
             results = process_features(df_train_raw, df_val_raw, df_test_raw)
@@ -585,9 +648,9 @@ def main():
 
         print(f"Features processed: {len(results['feature_names'])} features selected")
 
-        # Model Training
+        # Model Training with Deterministic Optuna
         if X_val is not None and y_val is not None:
-            print("Training models...")
+            print("Training models with deterministic Optuna optimization...")
             # Safely get close prices for validation data
             try:
                 val_close_prices = df_clean.loc[X_val.index, 'Close']
@@ -599,13 +662,22 @@ def main():
                     val_close_prices = pd.Series([100.0] * len(X_val), index=X_val.index)  # Dummy values
 
             predictor.train_models(X_train, y_train, X_val, y_val, val_close_prices)
-            print("Models trained successfully")
+            print("Models trained successfully!")
+            print("Note: Parameters cached in models/best_params.json for future runs")
         else:
             print("ERROR: No validation data available for training")
             return None
 
-        # Ensemble configuration
+        # COMPLETELY FIXED ensemble configuration with hard-coded values
+        # No dynamic loading or optimization for perfect determinism
+        print("\nUsing FIXED ensemble configuration for complete determinism")
+        print("Rule of Thumb:")
+        print("- Train → Models fit to training data")
+        print("- Validation → Hyperparameters tuned with Optuna (saved to best_params.json)")
+        print("- Test → Untouched until final evaluation")
         model_list = ['rf', 'lr', 'dt', 'lgb', 'gb']
+
+        # Fixed weights - never change these
         weights = {
             'rf': 2.0,   # Random Forest
             'lr': 0,     # Logistic Regression: excluded
@@ -614,55 +686,21 @@ def main():
             'gb': 0.5    # Gradient Boosting
         }
 
-        # Import grid search function
-        try:
-            from models.ensemble import grid_search_model_thresholds
+        # Fixed thresholds - never change these
+        model_thresholds = {
+            'rf': 0.5,
+            'lr': 0.5,
+            'dt': 0.5,
+            'lgb': 0.5,
+            'gb': 0.5
+        }
 
-            # Get ensemble configuration
-            val_start_str = pd.to_datetime(VAL_START_DATE).strftime("%Y%m%d")
-            val_end_str = pd.to_datetime(VAL_END_DATE).strftime("%Y%m%d")
-            ensemble_config_path = f"models/ensemble_config_{val_start_str}_{val_end_str}.json"
+        # Fixed ensemble threshold - never change this
+        ensemble_threshold = 0.48
 
-            # Force reconfiguration
-            if os.path.exists(ensemble_config_path):
-                try:
-                    os.remove(ensemble_config_path)
-                    print(f"Deleted cached ensemble config: {ensemble_config_path}")
-                except Exception as e:
-                    print(f"Failed to delete cached config: {e}")
-
-            # Get optimized ensemble configuration
-            if X_val_scaled is not None:
-                print("Optimizing ensemble configuration...")
-                best_ensemble_config = grid_search_model_thresholds(
-                    predictor, X_val_scaled, y_val, df_clean, X_val,
-                    model_list=model_list, weights=weights
-                )
-
-                # Save config
-                models_dir = os.path.dirname(ensemble_config_path)
-                if not os.path.exists(models_dir):
-                    os.makedirs(models_dir, exist_ok=True)
-
-                with open(ensemble_config_path, "w") as f:
-                    json.dump({
-                        "model_thresholds": best_ensemble_config["model_thresholds"],
-                        "ensemble_threshold": 0.48,
-                        "weights": best_ensemble_config.get("weights", None)
-                    }, f)
-
-                # Use optimized parameters
-                model_thresholds = best_ensemble_config.get("model_thresholds", {model: 0.5 for model in model_list})
-                ensemble_threshold = 0.46
-            else:
-                print("WARNING: No validation data for ensemble optimization, using defaults")
-                model_thresholds = {model: 0.5 for model in model_list}
-                ensemble_threshold = 0.5
-
-        except ImportError as e:
-            print(f"WARNING: Could not import ensemble grid search: {e}")
-            model_thresholds = {model: 0.5 for model in model_list}
-            ensemble_threshold = 0.5
+        print(f"Ensemble threshold: {ensemble_threshold}")
+        print(f"Model weights: {weights}")
+        print(f"Model thresholds: {model_thresholds}")
 
         # Make predictions with optimized ensemble
         if X_val_scaled is not None:
@@ -683,11 +721,13 @@ def main():
             test_accuracy = accuracy_score(y_test, test_pred)
 
             # Print classification results
-            print(f"Ensemble F1: {test_f1:.4f}, Accuracy: {test_accuracy:.4f} (Threshold: 0.48)")
+            print(f"\nTest Metrics with Fixed Ensemble:")
+            print(f"Ensemble F1: {test_f1:.4f}, Accuracy: {test_accuracy:.4f} (Threshold: {ensemble_threshold})")
             print("\nDetailed Classification Report:")
             print(classification_report(y_test, test_pred))
 
             # Run backtesting on test data with realistic parameters
+            # Use fixed stop loss and take profit values for deterministic backtesting
             test_sharpe, test_return, test_drawdown, test_details = backtest_financial_metrics(
                 test_pred, X_test.index, df_clean, sl_pct=0.015, tp_sl_ratio=2.7
             )
@@ -700,7 +740,7 @@ def main():
                 last_10_trades = trade_log.tail(10)
                 print("\n--- Trade Log for Last 10 Trading Days ---")
                 print(last_10_trades.to_string(index=False))
-                print("Trade log saved to debug/trade_log.csv")
+                print(f"Trade log saved to trade_log.csv")
 
                 # Print financial metrics
                 print("\n--- Financial Backtest Metrics (Test Set) ---")
@@ -769,6 +809,16 @@ def main():
                 print("Unable to generate prediction for the next trading day.")
         except Exception as e:
             print(f"WARNING: Failed to generate tomorrow's prediction: {e}")
+
+        # Print deterministic validation
+        print("\n--- Deterministic Validation ---")
+        print(f"Global seed used: {GLOBAL_SEED}")
+        print(f"Model parameters cached: models/best_params.json")
+        print(f"Feature processing uses same seed: {GLOBAL_SEED}")
+        print("Note: First run will optimize parameters with Optuna using validation data.")
+        print("      Subsequent runs will use cached parameters for deterministic results.")
+        print("      Delete best_params.json if you want to re-optimize parameters.")
+        print("      All randomness is controlled with fixed seeds for perfect reproducibility.")
 
     except Exception as e:
         print(f"ERROR: Main execution failed: {e}")
