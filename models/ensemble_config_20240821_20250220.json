@@ -1,0 +1,1 @@
+{"model_thresholds": {"rf": 0.5, "lr": 0.5, "dt": 0.5, "lgb": 0.5, "gb": 0.5}, "ensemble_threshold": 0.48, "weights": {"rf": 2.0, "lr": 0, "dt": 0, "lgb": 1.5, "gb": 0.5}}
