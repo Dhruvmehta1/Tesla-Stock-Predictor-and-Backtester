@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import os
+from scipy import stats
 
 def supertrend(df, atr_period=10, factor=3.0):
     """
@@ -12,1009 +13,919 @@ def supertrend(df, atr_period=10, factor=3.0):
     for col in required_cols:
         if col not in df.columns:
             print(f"ERROR: Missing required column '{col}' for supertrend calculation.")
-            # Return empty series with same index as df
             return pd.Series(0, index=df.index), pd.Series(0, index=df.index)
 
-    # Add a copy to avoid modifying the original
     df = df.copy()
-
-    # Calculate ATR
     high = df['High']
     low = df['Low']
     close = df['Close']
 
-    # Calculate true range
+    # Calculate true range (using previous close to avoid lookahead)
+    prev_close = close.shift(1)
     tr1 = high - low
-    tr2 = abs(high - close.shift(1))
-    tr3 = abs(low - close.shift(1))
+    tr2 = abs(high - prev_close)
+    tr3 = abs(low - prev_close)
     tr = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
-    atr = tr.rolling(atr_period).mean()
+    atr = tr.rolling(atr_period, min_periods=atr_period).mean()
 
-    # Calculate bands
-    upperband = (high + low) / 2 + (factor * atr)
-    lowerband = (high + low) / 2 - (factor * atr)
+    # Calculate bands using HL2
+    hl2 = (high + low) / 2
+    upperband = hl2 + (factor * atr)
+    lowerband = hl2 - (factor * atr)
 
-    # Initialize Supertrend
+    # Initialize Supertrend - shift everything by 1 to prevent lookahead
     supertrend = pd.Series(0.0, index=df.index)
     direction = pd.Series(1, index=df.index)
 
-    # First value is by definition a buy
-    supertrend.iloc[0] = lowerband.iloc[0]
-
     # Calculate Supertrend using strictly causal logic
     for i in range(1, len(df)):
-        # Previous values
-        prev_close = close.iloc[i-1]
+        if i == 1:
+            supertrend.iloc[i] = lowerband.iloc[i-1] if not pd.isna(lowerband.iloc[i-1]) else 0
+            continue
+
+        prev_close_val = close.iloc[i-1]
         prev_supertrend = supertrend.iloc[i-1]
-        prev_direction = direction.iloc[i-1]
 
-        # Current close
-        curr_close = close.iloc[i]
+        # Use previous day's bands to avoid lookahead
+        curr_upper = upperband.iloc[i-1] if not pd.isna(upperband.iloc[i-1]) else prev_supertrend
+        curr_lower = lowerband.iloc[i-1] if not pd.isna(lowerband.iloc[i-1]) else prev_supertrend
 
-        if prev_supertrend <= prev_close:
-            # We were in uptrend
-            supertrend.iloc[i] = max(lowerband.iloc[i], prev_supertrend)
+        if prev_supertrend <= prev_close_val:
+            # Was in uptrend - use lower band
+            supertrend.iloc[i] = max(curr_lower, prev_supertrend)
         else:
-            # We were in downtrend
-            supertrend.iloc[i] = min(upperband.iloc[i], prev_supertrend)
+            # Was in downtrend - use upper band
+            supertrend.iloc[i] = min(curr_upper, prev_supertrend)
 
-        # Determine current direction
-        if curr_close <= supertrend.iloc[i]:
+        # Determine direction based on previous close vs current supertrend
+        if prev_close_val <= supertrend.iloc[i]:
             direction.iloc[i] = -1  # Downtrend
         else:
             direction.iloc[i] = 1   # Uptrend
 
     return supertrend, direction
 
-def engineer_features(df, sector_df=None, spy_df=None):
-    """Enhanced feature engineering WITHOUT data leakage
-    Optionally merges sector ETF and SPY data for relative features.
+def create_advanced_pattern_features(df):
     """
-    # Create a copy to avoid modifying original
-    df = df.copy()
-
-    # Dictionary to store all new features - avoids DataFrame fragmentation
+    Create advanced pattern recognition features that combine multiple indicators
+    to detect complex market patterns that standalone features cannot capture.
+    """
     features = {}
 
-    # --- EMA (Exponential Moving Averages) with strict causality ---
-    features['EMA12'] = df['Close'].shift(1).ewm(span=12, adjust=False).mean()
-    features['EMA26'] = df['Close'].shift(1).ewm(span=26, adjust=False).mean()
-    features['EMA50'] = df['Close'].shift(1).ewm(span=50, adjust=False).mean()
-    features['EMA200'] = df['Close'].shift(1).ewm(span=200, adjust=False).mean()
-    features['EMA12_26_diff'] = features['EMA12'] - features['EMA26']
-    features['EMA12_50_diff'] = features['EMA12'] - features['EMA50']
-    features['EMA50_200_diff'] = features['EMA50'] - features['EMA200']
+    # Ensure we have required columns
+    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    for col in required_cols:
+        if col not in df.columns:
+            print(f"Warning: Missing {col} for advanced pattern features")
+            return features
 
-    # --- Stochastic Oscillator ---
-    low14 = df['Low'].rolling(window=14, min_periods=14).min()
-    high14 = df['High'].rolling(window=14, min_periods=14).max()
-    features['Stoch_%K'] = 100 * (df['Close'] - low14) / (high14 - low14 + 1e-10)
-    features['Stoch_%D'] = features['Stoch_%K'].rolling(window=3, min_periods=3).mean()
+    # Use lagged prices to prevent lookahead bias
+    prev_close = df['Close'].shift(1)
+    prev_high = df['High'].shift(1)
+    prev_low = df['Low'].shift(1)
+    prev_open = df['Open'].shift(1)
+    prev_volume = df['Volume'].shift(1)
 
-    # --- Williams %R ---
-    features['Williams_%R'] = -100 * (high14 - df['Close']) / (high14 - low14 + 1e-10)
+    # === MOMENTUM CONVERGENCE/DIVERGENCE PATTERNS ===
 
-    # --- Commodity Channel Index (CCI) ---
-    tp = (df['High'] + df['Low'] + df['Close']) / 3
-    ma_tp = tp.rolling(window=20, min_periods=20).mean()
-    md = tp.rolling(window=20, min_periods=20).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
-    features['CCI'] = (tp - ma_tp) / (0.015 * md + 1e-10)
+    # Multi-timeframe momentum alignment
+    short_momentum = prev_close / prev_close.shift(3) - 1  # 3-day
+    med_momentum = prev_close / prev_close.shift(7) - 1    # 1-week
+    long_momentum = prev_close / prev_close.shift(21) - 1  # 1-month
 
-    # --- On-Balance Volume (OBV) ---
-    features['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+    # Momentum alignment score (-3 to +3)
+    momentum_signs = np.sign(short_momentum) + np.sign(med_momentum) + np.sign(long_momentum)
+    features['Momentum_Alignment'] = momentum_signs
 
-    # --- Chaikin Money Flow (CMF) ---
-    mfv = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low'] + 1e-10) * df['Volume']
-    features['CMF'] = mfv.rolling(window=20, min_periods=20).sum() / df['Volume'].rolling(window=20, min_periods=20).sum()
+    # Momentum acceleration pattern
+    momentum_accel = short_momentum - short_momentum.shift(1)
+    features['Momentum_Acceleration'] = momentum_accel
 
-    # --- Supertrend Indicator ---
-    supertrend_val, supertrend_dir = supertrend(df, atr_period=10, factor=3.0)
-    features['Supertrend_Direction'] = supertrend_dir
+    # Divergence between price and volume momentum
+    volume_momentum = prev_volume / prev_volume.shift(5) - 1
+    price_volume_divergence = np.sign(med_momentum) - np.sign(volume_momentum)
+    features['Price_Volume_Divergence'] = price_volume_divergence
 
-    # --- Average Directional Index (ADX) ---
-    up_move = df['High'].diff()
-    down_move = -df['Low'].diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    tr = np.maximum(
-        df['High'] - df['Low'],
-        np.maximum(
-            abs(df['High'] - df['Close'].shift(1)),
-            abs(df['Low'] - df['Close'].shift(1))
-        )
-    )
-    atr = pd.Series(tr).rolling(window=14, min_periods=14).mean()
-    plus_di = 100 * pd.Series(plus_dm).rolling(window=14, min_periods=14).sum() / (atr + 1e-10)
-    minus_di = 100 * pd.Series(minus_dm).rolling(window=14, min_periods=14).sum() / (atr + 1e-10)
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
-    features['ADX'] = pd.Series(dx).rolling(window=14, min_periods=14).mean()
+    # === VOLATILITY REGIME PATTERNS ===
 
-    # --- Donchian Channel (20-day high/low) ---
-    features['Donchian_High_20'] = df['High'].rolling(window=20, min_periods=20).max()
-    features['Donchian_Low_20'] = df['Low'].rolling(window=20, min_periods=20).min()
+    # Multi-period volatility pattern
+    vol_short = prev_close.rolling(5).std()
+    vol_med = prev_close.rolling(20).std()
+    vol_long = prev_close.rolling(60).std()
 
-    # --- Parabolic SAR (simple version) ---
-    sar_values = np.full(len(df), np.nan)
-    af = 0.02
-    max_af = 0.2
-    trend = 1  # 1 for up, -1 for down
-    ep = df['Low'].iloc[0]
-    sar = df['High'].iloc[0]
-    for i in range(2, len(df)):
-        prev_sar = sar
-        if trend == 1:
-            sar = prev_sar + af * (ep - prev_sar)
-            if df['Low'].iloc[i] < sar:
-                trend = -1
-                sar = ep
-                ep = df['High'].iloc[i]
-                af = 0.02
-            else:
-                if df['High'].iloc[i] > ep:
-                    ep = df['High'].iloc[i]
-                    af = min(af + 0.02, max_af)
-        else:
-            sar = prev_sar + af * (ep - prev_sar)
-            if df['High'].iloc[i] > sar:
-                trend = 1
-                sar = ep
-                ep = df['Low'].iloc[i]
-                af = 0.02
-            else:
-                if df['Low'].iloc[i] < ep:
-                    ep = df['Low'].iloc[i]
-                    af = min(af + 0.02, max_af)
-        sar_values[i] = sar
-    features['SAR'] = pd.Series(sar_values, index=df.index)
+    # Volatility regime classification
+    vol_regime = np.where(vol_short > vol_med * 1.5, 2,  # High vol
+                 np.where(vol_short < vol_med * 0.5, 0, 1))  # Low/Normal vol
+    features['Volatility_Regime'] = vol_regime
 
-    # --- Accumulation/Distribution Line (ADL) ---
-    clv = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low'] + 1e-10)
-    features['ADL'] = (clv * df['Volume']).cumsum()
+    # Volatility breakout pattern - when volatility expands rapidly
+    vol_expansion = (vol_short / (vol_med + 1e-10)) > 2.0
+    features['Volatility_Breakout'] = vol_expansion.astype(int)
 
-    # Lag features (safe - using past data)
-    features['lag1_Close'] = df['Close'].shift(1)
-    features['lag2_Close'] = df['Close'].shift(2)
-    features['lag3_Close'] = df['Close'].shift(3)
+    # Volatility compression pattern - potential breakout setup
+    vol_compression = (vol_short / (vol_long + 1e-10)) < 0.3
+    features['Volatility_Compression'] = vol_compression.astype(int)
 
-    # Moving averages (strictly causal - using only past data with one day offset)
-    features['MA5'] = df['Close'].shift(1).rolling(5, min_periods=5).mean()
-    features['MA9'] = df['Close'].shift(1).rolling(9, min_periods=9).mean()
-    features['MA10'] = df['Close'].shift(1).rolling(10, min_periods=10).mean()
-    features['MA20'] = df['Close'].shift(1).rolling(20, min_periods=20).mean()
-    features['MA21'] = df['Close'].shift(1).rolling(21, min_periods=21).mean()
-    features['MA50'] = df['Close'].shift(1).rolling(50, min_periods=50).mean()
-    # --- Z-score of price relative to MA20 (strictly causal implementation) ---
-    features['Zscore_Close_MA20'] = (df['Close'].shift(1) - features['MA20']) / (
-        df['Close'].shift(1).rolling(20, min_periods=20).apply(
-            lambda x: np.std(x[:-1]), raw=True  # Use only past values in the window
-        ) + 1e-10
-    )
-    # --- Slope of MA20 (trend strength alternative) - with shift to ensure causality ---
-    features['MA20_Slope'] = features['MA20'].diff(5) / 5
+    # === PRICE ACTION PATTERNS ===
 
-    # Price ratios to moving averages - using previous day's close for strict causality
-    features['Price_to_MA5'] = df['Close'].shift(1) / features['MA5'] - 1
-    features['Price_to_MA10'] = df['Close'].shift(1) / features['MA10'] - 1
-    features['Price_to_MA20'] = df['Close'].shift(1) / features['MA20'] - 1
-    features['MA9_MA21_Ratio'] = features['MA9'] / features['MA21']
+    # Complex candlestick patterns
+    body_size = abs(prev_close - prev_open) / (prev_open + 1e-10)
+    upper_wick = (prev_high - np.maximum(prev_open, prev_close)) / (prev_close + 1e-10)
+    lower_wick = (np.minimum(prev_open, prev_close) - prev_low) / (prev_close + 1e-10)
 
-    # Returns (safe - using past prices)
-    features['Returns_1d'] = df['Close'].pct_change(1)
-    features['Returns_2d'] = df['Close'].pct_change(2)
-    features['Returns_3d'] = df['Close'].pct_change(3)
-    features['Returns_5d'] = df['Close'].pct_change(5)
-    features['Returns_10d'] = df['Close'].pct_change(10)
+    # Doji pattern (small body, long wicks)
+    doji_pattern = ((body_size < 0.01) & ((upper_wick + lower_wick) > 0.02)).astype(int)
+    features['Doji_Pattern'] = doji_pattern
 
-    # Volatility (safe - using past returns)
-    features['Volatility_5d'] = features['Returns_1d'].rolling(5, min_periods=5).std()
-    features['Volatility_10d'] = features['Returns_1d'].rolling(10, min_periods=10).std()
-    features['Volatility_20d'] = features['Returns_1d'].rolling(20, min_periods=20).std()
+    # Hammer/Hanging man pattern
+    hammer_pattern = ((lower_wick > 2 * body_size) & (upper_wick < body_size)).astype(int)
+    features['Hammer_Pattern'] = hammer_pattern
 
-    # ATR and related features
-    features['prev_close'] = df['Close'].shift(1)
-    features['TR'] = np.maximum(df['High'] - df['Low'],
-                          np.maximum(abs(df['High'] - features['prev_close']),
-                                     abs(df['Low'] - features['prev_close'])))
-    features['ATR'] = features['TR'].rolling(14, min_periods=14).mean()
-    features['ATR_14'] = features['ATR']
-    features['ATR_ratio'] = features['ATR_14'] / df['Close']
+    # Shooting star pattern
+    star_pattern = ((upper_wick > 2 * body_size) & (lower_wick < body_size)).astype(int)
+    features['Shooting_Star_Pattern'] = star_pattern
 
-    # High volatility flag
-    features['ATR_20d_quantile'] = features['ATR'].rolling(20, min_periods=20).quantile(0.8)
-    features['High_Vol_Flag'] = (features['ATR'] > features['ATR_20d_quantile']).astype(int)
+    # === TREND STRENGTH & QUALITY PATTERNS ===
 
-    # Bollinger Bands
-    features['BB_middle'] = df['Close'].rolling(20, min_periods=20).mean()
-    features['BB_std'] = df['Close'].rolling(20, min_periods=20).std()
-    features['BB_upper'] = features['BB_middle'] + 2 * features['BB_std']
-    features['BB_lower'] = features['BB_middle'] - 2 * features['BB_std']
-    features['BB_position'] = (df['Close'] - features['BB_lower']) / (features['BB_upper'] - features['BB_lower'])
-    features['BB_Width'] = features['BB_upper'] - features['BB_lower']
-    features['BB_squeeze'] = features['BB_std'] / features['BB_middle']
+    # Calculate EMAs for trend analysis
+    ema_fast = prev_close.ewm(span=8, min_periods=8).mean()
+    ema_med = prev_close.ewm(span=21, min_periods=21).mean()
+    ema_slow = prev_close.ewm(span=50, min_periods=50).mean()
 
-    # RSI with strict causality - using lagged price changes
-    delta = df['Close'].shift(1).diff()
+    # Trend quality - how consistently price stays above/below EMAs
+    above_emas = ((prev_close > ema_fast) & (ema_fast > ema_med) & (ema_med > ema_slow)).astype(int)
+    below_emas = ((prev_close < ema_fast) & (ema_fast < ema_med) & (ema_med < ema_slow)).astype(int)
+    features['Strong_Uptrend'] = above_emas
+    features['Strong_Downtrend'] = below_emas
+
+    # Trend strength score based on EMA alignment
+    ema_alignment = np.where(above_emas, 2, np.where(below_emas, -2, 0))
+    features['Trend_Strength_Score'] = ema_alignment
+
+    # EMA convergence/divergence pattern
+    ema_spread = (ema_fast - ema_slow) / (ema_slow + 1e-10)
+    ema_convergence = (abs(ema_spread) < abs(ema_spread.shift(5))).astype(int)
+    features['EMA_Convergence'] = ema_convergence
+
+    # === SUPPORT/RESISTANCE PATTERNS ===
+
+    # Dynamic support/resistance levels
+    high_20 = prev_high.rolling(20, min_periods=20).max()
+    low_20 = prev_low.rolling(20, min_periods=20).min()
+    high_50 = prev_high.rolling(50, min_periods=50).max()
+    low_50 = prev_low.rolling(50, min_periods=50).min()
+
+    # Distance from key levels
+    dist_from_high = (high_20 - prev_close) / (prev_close + 1e-10)
+    dist_from_low = (prev_close - low_20) / (prev_close + 1e-10)
+
+    features['Distance_From_20D_High'] = dist_from_high
+    features['Distance_From_20D_Low'] = dist_from_low
+
+    # Support/resistance test pattern
+    resistance_test = ((prev_high >= high_20 * 0.99) & (prev_close < high_20 * 0.98)).astype(int)
+    support_test = ((prev_low <= low_20 * 1.01) & (prev_close > low_20 * 1.02)).astype(int)
+
+    features['Resistance_Test'] = resistance_test
+    features['Support_Test'] = support_test
+
+    # === VOLUME PATTERNS ===
+
+    # Volume-price relationship patterns
+    vol_ma = prev_volume.rolling(20, min_periods=20).mean()
+    price_up = (prev_close > prev_close.shift(1)).astype(int)
+    volume_above_avg = (prev_volume > vol_ma * 1.2).astype(int)
+
+    # Bullish/bearish volume patterns
+    features['Bullish_Volume'] = (price_up & volume_above_avg).astype(int)
+    features['Bearish_Volume'] = ((1 - price_up) & volume_above_avg).astype(int)
+
+    # Volume accumulation/distribution pattern
+    vol_trend = prev_volume.rolling(10).mean() / prev_volume.rolling(30).mean()
+    features['Volume_Accumulation'] = (vol_trend > 1.1).astype(int)
+    features['Volume_Distribution'] = (vol_trend < 0.9).astype(int)
+
+    # === MEAN REVERSION PATTERNS ===
+
+    # Calculate Bollinger Bands
+    bb_period = 20
+    bb_ma = prev_close.rolling(bb_period, min_periods=bb_period).mean()
+    bb_std = prev_close.rolling(bb_period, min_periods=bb_period).std()
+    bb_upper = bb_ma + (2 * bb_std)
+    bb_lower = bb_ma - (2 * bb_std)
+
+    # Bollinger Band squeeze pattern
+    bb_squeeze = ((bb_upper - bb_lower) / (bb_ma + 1e-10)) < 0.1
+    features['BB_Squeeze'] = bb_squeeze.astype(int)
+
+    # Mean reversion setup - price at extremes with low volatility
+    at_bb_upper = (prev_close > bb_upper * 0.98).astype(int)
+    at_bb_lower = (prev_close < bb_lower * 1.02).astype(int)
+    low_vol = (vol_short < vol_med).astype(int)
+
+    features['Mean_Reversion_Up_Setup'] = (at_bb_lower & low_vol).astype(int)
+    features['Mean_Reversion_Down_Setup'] = (at_bb_upper & low_vol).astype(int)
+
+    # === MOMENTUM OSCILLATOR PATTERNS ===
+
+    # RSI-based patterns (using proper lagged calculation)
+    rsi_period = 14
+    delta = prev_close.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(14, min_periods=14).mean()
-    avg_loss = loss.rolling(14, min_periods=14).mean()
+    avg_gain = gain.rolling(rsi_period, min_periods=rsi_period).mean()
+    avg_loss = loss.rolling(rsi_period, min_periods=rsi_period).mean()
     rs = avg_gain / (avg_loss + 1e-10)
-    features['RSI'] = 100 - (100 / (1 + rs))
-    features['RSI_oversold'] = (features['RSI'] < 30).astype(int)
-    features['RSI_overbought'] = (features['RSI'] > 70).astype(int)
+    rsi = 100 - (100 / (1 + rs))
 
-    # MACD with strict causality - using lagged prices
-    ema_12 = df['Close'].shift(1).ewm(span=12, min_periods=12).mean()
-    ema_26 = df['Close'].shift(1).ewm(span=26, min_periods=26).mean()
-    features['MACD'] = ema_12 - ema_26
-    features['Signal_Line'] = features['MACD'].ewm(span=9, min_periods=9).mean()
-    features['MACD_histogram'] = features['MACD'] - features['Signal_Line']
-    features['MACD_bullish'] = (features['MACD'] > features['Signal_Line']).astype(int)
+    # RSI divergence pattern
+    rsi_higher_low = ((rsi > rsi.shift(5)) & (prev_close < prev_close.shift(5))).astype(int)
+    rsi_lower_high = ((rsi < rsi.shift(5)) & (prev_close > prev_close.shift(5))).astype(int)
 
-    # Crossover signals (safe - comparing current to previous)
-    features['MACD_Signal_crossover'] = np.where(
-        (features['MACD'] > features['Signal_Line']) & (features['MACD'].shift(1) <= features['Signal_Line'].shift(1)), 1,
-        np.where((features['MACD'] < features['Signal_Line']) & (features['MACD'].shift(1) >= features['Signal_Line'].shift(1)), -1, 0)
+    features['RSI_Bullish_Divergence'] = rsi_higher_low
+    features['RSI_Bearish_Divergence'] = rsi_lower_high
+
+    # RSI momentum pattern
+    rsi_momentum = rsi - rsi.shift(3)
+    features['RSI_Momentum'] = rsi_momentum
+
+    # === BREAKOUT PATTERNS ===
+
+    # Price breakout from consolidation
+    range_20 = high_20 - low_20
+    consolidation = (range_20 / (prev_close + 1e-10)) < 0.05  # Tight range
+
+    upward_breakout = (prev_close > high_20.shift(1)).astype(int)
+    downward_breakout = (prev_close < low_20.shift(1)).astype(int)
+
+    features['Consolidation_Pattern'] = consolidation.astype(int)
+    features['Upward_Breakout'] = (upward_breakout & consolidation.shift(1)).astype(int)
+    features['Downward_Breakout'] = (downward_breakout & consolidation.shift(1)).astype(int)
+
+    # === MULTI-INDICATOR CONFLUENCE ===
+
+    # Bullish confluence score
+    bullish_signals = (
+        (momentum_signs > 0).astype(int) +
+        above_emas +
+        (rsi > 50).astype(int) +
+        (prev_close > bb_ma).astype(int) +
+        volume_above_avg * price_up
     )
+    features['Bullish_Confluence'] = bullish_signals
 
-    features['MA9_21_crossover'] = np.where(
-        (features['MA9'] > features['MA21']) & (features['MA9'].shift(1) <= features['MA21'].shift(1)), 1,
-        np.where((features['MA9'] < features['MA21']) & (features['MA9'].shift(1) >= features['MA21'].shift(1)), -1, 0)
+    # Bearish confluence score
+    bearish_signals = (
+        (momentum_signs < 0).astype(int) +
+        below_emas +
+        (rsi < 50).astype(int) +
+        (prev_close < bb_ma).astype(int) +
+        volume_above_avg * (1 - price_up)
     )
+    features['Bearish_Confluence'] = bearish_signals
 
-    # Volume features (safe - using past volume data)
-    features['Volume_MA_5'] = df['Volume'].rolling(5, min_periods=5).mean()
-    features['Volume_MA_20'] = df['Volume'].rolling(20, min_periods=20).mean()
-    features['Volume_ratio'] = df['Volume'] / features['Volume_MA_20']
-    features['Volume_trend'] = features['Volume_MA_5'] / features['Volume_MA_20']
+    # === VOLATILITY-ADJUSTED PATTERNS ===
 
-    # Price action patterns (safe - using past prices)
-    features['Higher_high'] = ((df['High'] > df['High'].shift(1)) &
-                        (df['High'].shift(1) > df['High'].shift(2))).astype(int)
-    features['Lower_low'] = ((df['Low'] < df['Low'].shift(1)) &
-                      (df['Low'].shift(1) < df['Low'].shift(2))).astype(int)
+    # Normalize patterns by current volatility regime
+    vol_adj_factor = vol_short / (vol_med + 1e-10)
 
-    # Gap detection (safe - comparing current open to previous close)
-    features['Gap_up'] = (df['Open'] > features['prev_close'] * 1.02).astype(int)
-    features['Gap_down'] = (df['Open'] < features['prev_close'] * 0.98).astype(int)
+    # Volatility-adjusted momentum
+    features['Vol_Adj_Momentum'] = med_momentum / (vol_adj_factor + 1e-10)
 
-    # Momentum indicators (safe - using past prices)
-    features['Momentum_5'] = df['Close'] / df['Close'].shift(5) - 1
-    features['Momentum_10'] = df['Close'] / df['Close'].shift(10) - 1
+    # Volatility-adjusted support/resistance distances
+    features['Vol_Adj_Resistance_Dist'] = dist_from_high / (vol_adj_factor + 1e-10)
+    features['Vol_Adj_Support_Dist'] = dist_from_low / (vol_adj_factor + 1e-10)
 
-    # --- Relative Strength vs. Sector ETF and SPY ---
-    if 'Sector_Close' in df.columns:
-        features['TSLA_to_Sector'] = df['Close'] / df['Sector_Close']
-        features['Sector_Return'] = df['Sector_Close'].pct_change()
-        features['Sector_MA50'] = df['Sector_Close'].rolling(50, min_periods=50).mean()
-        features['Sector_Momentum_5'] = df['Sector_Close'] / df['Sector_Close'].shift(5) - 1
-        features['Relative_Momentum_Sector'] = features['Momentum_5'] - features['Sector_Momentum_5']
-    if 'SPY_Close' in df.columns:
-        features['TSLA_to_SPY'] = df['Close'] / df['SPY_Close']
-        features['SPY_Return'] = df['SPY_Close'].pct_change()
-        features['SPY_MA50'] = df['SPY_Close'].rolling(50, min_periods=50).mean()
-        features['SPY_Momentum_5'] = df['SPY_Close'] / df['SPY_Close'].shift(5) - 1
-        features['Relative_Momentum_SPY'] = features['Momentum_5'] - features['SPY_Momentum_5']
+    # === MARKET MICROSTRUCTURE PATTERNS ===
 
-    # Support/Resistance levels (safe - using past high/low data)
-    features['High_20d'] = df['High'].rolling(20, min_periods=20).max()
-    features['Low_20d'] = df['Low'].rolling(20, min_periods=20).min()
-    features['Near_20d_high'] = (df['Close'] > features['High_20d'] * 0.98).astype(int)
-    features['Near_20d_low'] = (df['Close'] < features['Low_20d'] * 1.02).astype(int)
+    # Intraday strength pattern
+    intraday_strength = (prev_close - prev_low) / (prev_high - prev_low + 1e-10)
+    features['Intraday_Strength'] = intraday_strength
 
-    # Time-based features (safe - using current date)
-    features['Day_of_week'] = df.index.dayofweek
-    features['Month'] = df.index.month
-    features['Is_month_end'] = df.index.is_month_end.astype(int)
-    features['Is_friday'] = (df.index.dayofweek == 4).astype(int)
-    features['Is_monday'] = (df.index.dayofweek == 0).astype(int)
+    # Gap patterns with context
+    gap_up = prev_open > prev_close.shift(1) * 1.005
+    gap_down = prev_open < prev_close.shift(1) * 0.995
 
-    # Market regime features (safe - using past trend data)
-    features['Bull_market'] = (features['MA50'] > features['MA50'].shift(10)).astype(int)
-    # Use the already created MA20 (consistent naming)
-    features['Price_to_MA_20'] = df['Close'] / features['MA20'] - 1
-    features['Trend_strength'] = abs(features['Price_to_MA_20'])
+    # Gap fill patterns
+    gap_fill_up = (gap_down & (prev_high > prev_close.shift(1))).astype(int)
+    gap_fill_down = (gap_up & (prev_low < prev_close.shift(1))).astype(int)
 
-    # Additional safe features
-    features['Close_to_High'] = df['Close'] / df['High']
-    features['Close_to_Low'] = df['Close'] / df['Low']
-    features['High_Low_ratio'] = df['High'] / df['Low']
-    features['Body_size'] = abs(df['Close'] - df['Open']) / df['Open']
-    features['Upper_shadow'] = (df['High'] - np.maximum(df['Open'], df['Close'])) / df['Close']
-    features['Lower_shadow'] = (np.minimum(df['Open'], df['Close']) - df['Low']) / df['Close']
+    features['Gap_Fill_Up'] = gap_fill_up
+    features['Gap_Fill_Down'] = gap_fill_down
 
-    # --- Stage 2: Features that depend on Stage 1 features or earlier ---
-    # All of these combined features need to shift by 1 to ensure strict causality
-    # 📉 Momentum × RSI / MACD
-    features['RSI_Momentum_5'] = features['RSI'].shift(1) * features['Momentum_5'].shift(1)
-    features['RSI_Momentum_10'] = features['RSI'].shift(1) * features['Momentum_10'].shift(1)
-    features['MACD_RSI_Interaction'] = features['MACD_histogram'].shift(1) * features['RSI'].shift(1)
-    features['MACD_Signal_Gap'] = features['MACD_histogram'].shift(1) - features['Signal_Line'].shift(1)
-    # 📊 Volatility × Price Action
-    features['Volatility_Returns'] = features['Volatility_5d'].shift(1) * features['Returns_3d'].shift(1)
-    features['BBWidth_to_MA'] = features['BB_Width'].shift(1) / (abs(features['Price_to_MA_20'].shift(1)) + 1e-6)
-    features['Volatility_Shadow'] = features['Volatility_10d'].shift(1) * features['Upper_shadow'].shift(1)
-    # 🔀 Price to MA Interactions
-    features['MA9_21_Combo'] = features['Price_to_MA10'].shift(1) * features['MA9_MA21_Ratio'].shift(1)
-    features['MA9_Momentum'] = features['Price_to_MA5'].shift(1) * features['Momentum_5'].shift(1)
-    features['BB_Squeeze_MA20'] = features['BB_squeeze'].shift(1) * features['Price_to_MA_20'].shift(1)
+    # === STATISTICAL PATTERNS ===
 
-    # --- Additional classic engineered combos from features.py ---
-    features['Friday_Momentum'] = features['Is_friday'] * features['Momentum_5']
-    features['Monday_GapUp'] = features['Is_monday'] * features['Gap_up']
-    features['Month_MA_ratio'] = features['Month'] * features['MA9_MA21_Ratio']
-    features['Volume_Momentum'] = features['Volume_ratio'] * features['Momentum_5']
-    features['Volume_Volatility'] = features['Volume_ratio'] * features['Volatility_5d']
-    features['Volume_Shadow'] = features['Volume_ratio'] * (features['Upper_shadow'] + features['Lower_shadow'])
-    features['NearHigh_Momentum'] = features['Near_20d_high'] * features['Momentum_10']
-    features['NearLow_GapDown'] = features['Near_20d_low'] * features['Gap_down']
-    features['ResistanceBreakout'] = features['Near_20d_high'] * features['Price_to_MA5']
-    features['Bull_RSI'] = features['Bull_market'] * features['RSI']
-    features['HighVol_GapUp'] = features['High_Vol_Flag'] * features['Gap_up']
-    features['Oversold_Body'] = features['RSI_oversold'] * features['Body_size']
-    features['ATR_vs_BodySize'] = features['ATR_ratio'] / (features['Body_size'] + 1e-6)
+    # Price rank within recent range
+    price_rank_20 = prev_close.rolling(20).rank(pct=True)
+    features['Price_Rank_20D'] = price_rank_20
 
-    # 🔄 Trend Confirmation Features - Supertrend + Other Indicators
-    # Supertrend + EMA alignment with strict causality
-    features['Supertrend_EMA_Confirm'] = features['Supertrend_Direction'].shift(1) * np.sign(features['EMA12_26_diff'].shift(1))
-    features['Supertrend_EMA_Agree'] = (np.sign(features['EMA12_26_diff'].shift(1)) == features['Supertrend_Direction'].shift(1)).astype(int)
+    # Volume rank within recent range
+    vol_rank_20 = prev_volume.rolling(20).rank(pct=True)
+    features['Volume_Rank_20D'] = vol_rank_20
 
-    # Supertrend + RSI confirmation with strict causality
-    features['Supertrend_RSI_Bull'] = (features['Supertrend_Direction'].shift(1) > 0) & (features['RSI'].shift(1) > 50)
-    features['Supertrend_RSI_Bear'] = (features['Supertrend_Direction'].shift(1) < 0) & (features['RSI'].shift(1) < 50)
-    features['Supertrend_RSI_Confirm'] = features['Supertrend_RSI_Bull'].astype(int) - features['Supertrend_RSI_Bear'].astype(int)
+    # Unusual volume with price movement
+    unusual_volume = (vol_rank_20 > 0.8) & (abs(med_momentum) > vol_med * 2)
+    features['Unusual_Volume_Move'] = unusual_volume.astype(int)
 
-    # Trend persistence - how long the current Supertrend has maintained direction
-    trend_shifts = features['Supertrend_Direction'].diff().fillna(0) != 0
-    features['Trend_Duration'] = (~trend_shifts).cumsum() * features['Supertrend_Direction']
+    return features
 
-    # Volatility-adjusted Supertrend signal (stronger in low volatility)
-    features['Supertrend_Vol_Adj'] = features['Supertrend_Direction'] / (features['Volatility_20d'] + 0.001)
-    # 🕰️ Time Features × Price Action
-    features['Friday_Momentum'] = features['Is_friday'] * features['Momentum_5']
-    features['Monday_GapUp'] = features['Is_monday'] * features['Gap_up']
-    features['Month_MA_ratio'] = features['Month'] * features['MA9_MA21_Ratio']
+def engineer_features(df, sector_df=None, spy_df=None):
+    """Enhanced feature engineering WITHOUT data leakage - completely rewritten"""
 
-    # 🕰️ Supertrend Time Interactions
-    features['Monday_Supertrend'] = features['Is_monday'] * features['Supertrend_Direction']
-    features['Friday_Supertrend'] = features['Is_friday'] * features['Supertrend_Direction']
-    features['Month_Supertrend'] = features['Is_month_end'] * features['Supertrend_Direction']
-    # 📈 Volume Behavior
-    features['Volume_Momentum'] = features['Volume_ratio'] * features['Momentum_5']
-    features['Volume_Volatility'] = features['Volume_ratio'] * features['Volatility_5d']
-    features['Volume_Shadow'] = features['Volume_ratio'] * (features['Upper_shadow'] + features['Lower_shadow'])
-    # 🔁 Support/Resistance × Momentum
-    features['NearHigh_Momentum'] = features['Near_20d_high'] * features['Momentum_10']
-    features['NearLow_GapDown'] = features['Near_20d_low'] * features['Gap_down']
-    features['ResistanceBreakout'] = features['Near_20d_high'] * features['Price_to_MA5']
-
-    # 🔁 Support/Resistance × Supertrend with strict causality
-    features['Supertrend_Breakout_High'] = (features['Supertrend_Direction'].shift(1) > 0) & features['Near_20d_high'].shift(1)
-    features['Supertrend_Bounce_Low'] = (features['Supertrend_Direction'].shift(1) > 0) & features['Near_20d_low'].shift(1)
-    features['Supertrend_Break_Score'] = features['Supertrend_Direction'].shift(1) * (df['Close'].shift(1) - features['MA20']) / features['MA20']
-
-    # 🔒 Boolean Flags × Quantitative Features
-    features['Bull_RSI'] = features['Bull_market'] * features['RSI']
-    features['HighVol_GapUp'] = features['High_Vol_Flag'] * features['Gap_up']
-    features['Oversold_Body'] = features['RSI_oversold'] * features['Body_size']
-    # Features that depend on Stage 1
-    features['ATR_vs_BodySize'] = features['ATR_ratio'] / (features['Body_size'] + 1e-6)
-
-    # 🌟 Multi-Signal Confirmation Systems with strict causality
-    # Signal strength index - combining multiple technical signals
-    features['Signal_Strength'] = (
-        (features['RSI'].shift(1) > 50).astype(int) +
-        (features['Supertrend_Direction'].shift(1) > 0).astype(int) +
-        (features['MA9'].shift(1) > features['MA21'].shift(1)).astype(int) +
-        (features['MACD'].shift(1) > features['Signal_Line'].shift(1)).astype(int) +
-        (df['Close'].shift(1) > features['BB_middle'].shift(1)).astype(int)
-    ) / 5.0  # Normalized to 0-1
-
-    # Divergence detection with strict causality
-    features['RSI_Price_Divergence'] = (df['Close'].shift(1) > df['Close'].shift(6)) & (features['RSI'].shift(1) < features['RSI'].shift(6))
-
-    # Supertrend-enhanced pattern strength with strict causality
-    features['Trend_Pattern_Strength'] = features['Supertrend_Direction'].shift(1) * features['Signal_Strength'].shift(1) * (1 + abs(features['Momentum_5'].shift(1)))
-
-    # Combine all features at once to avoid fragmentation
-    new_features_df = pd.DataFrame(features, index=df.index)
-    result_df = pd.concat([df, new_features_df], axis=1)
-
-    return result_df
-
-def engineer_features_incremental(df, sector_df=None, spy_df=None):
-    """
-    Incremental feature engineering with caching.
-    Always loads and saves cache from features/features_cache.csv.
-    Only computes features for new/unseen dates and appends to cache.
-    """
-    # Safety check - ensure df is valid
-    if df is None or len(df) == 0:
-        print("WARNING: Empty dataframe passed to engineer_features_incremental.")
+    if df is None or df.empty:
+        print("ERROR: Empty or None dataframe passed to engineer_features")
         return pd.DataFrame()
 
-    # Check required columns
-    required_cols = ['High', 'Low', 'Close', 'Open', 'Volume']
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
-        print(f"WARNING: Missing required columns {missing_cols} for feature engineering.")
-        return df  # Return original dataframe
-
-    # Ensure directory exists
-    os.makedirs("tesla_stock_predictor/features", exist_ok=True)
-
-    cache_path = "tesla_stock_predictor/features/features_cache.csv"
-    # Load cached features if they exist
-    try:
-        if os.path.exists(cache_path):
-            cached = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-            last_cached_date = cached.index.max()
-            # Only compute features for new dates
-            new_df = df[df.index > last_cached_date]
-        else:
-            cached = pd.DataFrame()
-            new_df = df
-    except Exception as e:
-        print(f"Error loading feature cache: {e}. Computing all features.")
-        cached = pd.DataFrame()
-        new_df = df
-
-    if not new_df.empty:
-        new_features = engineer_features(new_df, sector_df=sector_df, spy_df=spy_df)
-        if new_features is not None and not new_features.empty:
-            # Remove any overlap just in case
-            if not cached.empty:
-                new_features = new_features[~new_features.index.isin(cached.index)]
-            # Append new features to cache
-            cached = pd.concat([cached, new_features])
-            cached.to_csv(cache_path)
-
-    return cached
-
-def generate_features_for_next_day(df, sector_df=None, spy_df=None):
-    """
-    Generate features for the next trading day using only data up to the last available date.
-    Returns a DataFrame with a single row for the next trading day.
-    """
-    # Find the next business day (or trading day)
-    last_date = df.index[-1]
-    next_day = last_date + pd.Timedelta(days=1)
-    while next_day.weekday() >= 5:  # Skip weekends
-        next_day += pd.Timedelta(days=1)
-
-    # Create a new DataFrame with the next day as index, copying the last row's data
-    next_row = df.iloc[[-1]].copy()
-    next_row.index = [next_day]
-
-    # Concatenate to simulate the new day for rolling features
-    df_extended = pd.concat([df, next_row])
-
-    # Recompute features for the extended DataFrame
-    features_df = engineer_features(df_extended, sector_df=sector_df, spy_df=spy_df)
-
-    # Defensive: If features_df is None or empty, raise a clear error
-    if features_df is None or features_df.empty:
-        raise ValueError("Feature generation for next day failed or returned empty DataFrame.")
-    # Return only the last row (the next day)
-    return features_df.iloc[[-1]]
-
-    # Create a copy to avoid modifying original
     df = df.copy()
-
-    # Dictionary to store all new features - avoids DataFrame fragmentation
     features = {}
 
-    # --- EMA (Exponential Moving Averages) ---
-    features['EMA12'] = df['Close'].ewm(span=12, adjust=False).mean()
-    features['EMA26'] = df['Close'].ewm(span=26, adjust=False).mean()
-    features['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    features['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    features['EMA12_26_diff'] = features['EMA12'] - features['EMA26']
-    features['EMA12_50_diff'] = features['EMA12'] - features['EMA50']
-    features['EMA50_200_diff'] = features['EMA50'] - features['EMA200']
+    # Verify required columns exist
+    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        print(f"ERROR: Missing required columns: {missing_cols}")
+        return df
 
-    # --- Stochastic Oscillator ---
-    low14 = df['Low'].rolling(window=14, min_periods=14).min()
-    high14 = df['High'].rolling(window=14, min_periods=14).max()
-    features['Stoch_%K'] = 100 * (df['Close'] - low14) / (high14 - low14 + 1e-10)
-    features['Stoch_%D'] = features['Stoch_%K'].rolling(window=3, min_periods=3).mean()
+    # CRITICAL: All calculations use shifted (lagged) data to prevent lookahead bias
+    prev_close = df['Close'].shift(1)
+    prev_high = df['High'].shift(1)
+    prev_low = df['Low'].shift(1)
+    prev_open = df['Open'].shift(1)
+    prev_volume = df['Volume'].shift(1)
 
-    # --- Williams %R ---
-    features['Williams_%R'] = -100 * (high14 - df['Close']) / (high14 - low14 + 1e-10)
+    # === BASIC TECHNICAL INDICATORS (All using lagged data) ===
 
-    # At the end of the function, after features are computed:
-    features_df = pd.DataFrame(features, index=df.index)
-    # Ensure 'Close' is present for downstream use
-    if 'Close' in df.columns and 'Close' not in features_df.columns:
-        features_df['Close'] = df['Close']
-    print("engineer_features: output features_df shape:", features_df.shape)
-    print("engineer_features: output features_df columns:", features_df.columns.tolist())
-    print("engineer_features: output features_df head:\n", features_df.head())
-    return features_df
+    # Moving Averages - using previous day's data only
+    for period in [5, 9, 10, 20, 21, 50, 200]:
+        features[f'MA{period}'] = prev_close.rolling(period, min_periods=period).mean()
 
-    # --- Commodity Channel Index (CCI) ---
-    tp = (df['High'] + df['Low'] + df['Close']) / 3
-    ma_tp = tp.rolling(window=20, min_periods=20).mean()
-    md = tp.rolling(window=20, min_periods=20).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
-    features['CCI'] = (tp - ma_tp) / (0.015 * md + 1e-10)
+    # Exponential Moving Averages
+    for period in [12, 26, 50, 200]:
+        features[f'EMA{period}'] = prev_close.ewm(span=period, min_periods=period).mean()
 
-    # --- On-Balance Volume (OBV) ---
-    features['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+    # EMA differences (trend indicators)
+    if 'EMA12' in features and 'EMA26' in features:
+        features['EMA12_26_diff'] = features['EMA12'] - features['EMA26']
+    if 'EMA12' in features and 'EMA50' in features:
+        features['EMA12_50_diff'] = features['EMA12'] - features['EMA50']
+    if 'EMA50' in features and 'EMA200' in features:
+        features['EMA50_200_diff'] = features['EMA50'] - features['EMA200']
 
-    # --- Chaikin Money Flow (CMF) ---
-    mfv = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low'] + 1e-10) * df['Volume']
-    features['CMF'] = mfv.rolling(window=20, min_periods=20).sum() / df['Volume'].rolling(window=20, min_periods=20).sum()
+    # === PRICE-TO-MA RATIOS (Using lagged data) ===
+    for period in [5, 10, 20, 50]:
+        ma_col = f'MA{period}'
+        if ma_col in features:
+            features[f'Price_to_{ma_col}'] = (prev_close / (features[ma_col] + 1e-10)) - 1
 
-    # --- Supertrend Indicator ---
-    supertrend_val, supertrend_dir = supertrend(df, atr_period=10, factor=3.0)
-    # features['Supertrend'] = supertrend_val  # Removed raw Supertrend value
-    features['Supertrend_Direction'] = supertrend_dir
+    # Cross-MA ratios
+    if 'MA9' in features and 'MA21' in features:
+        features['MA9_MA21_Ratio'] = features['MA9'] / (features['MA21'] + 1e-10)
 
-    # --- Average Directional Index (ADX) ---
-    up_move = df['High'].diff()
-    down_move = -df['Low'].diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    tr = np.maximum(df['High'] - df['Low'], np.maximum(abs(df['High'] - df['Close'].shift(1)), abs(df['Low'] - df['Close'].shift(1))))
-    atr = pd.Series(tr).rolling(window=14, min_periods=14).mean()
-    plus_di = 100 * pd.Series(plus_dm).rolling(window=14, min_periods=14).sum() / (atr + 1e-10)
-    minus_di = 100 * pd.Series(minus_dm).rolling(window=14, min_periods=14).sum() / (atr + 1e-10)
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
-    features['ADX'] = pd.Series(dx).rolling(window=14, min_periods=14).mean()
+    # === RETURNS & LAG FEATURES ===
+    for lag in [1, 2, 3, 5, 10, 20]:
+        features[f'Returns_{lag}d'] = df['Close'].pct_change(lag)
+        features[f'lag{lag}_Close'] = df['Close'].shift(lag)
 
-    # --- Donchian Channel (20-day high/low) ---
-    features['Donchian_High_20'] = df['High'].rolling(window=20, min_periods=20).max()
-    features['Donchian_Low_20'] = df['Low'].rolling(window=20, min_periods=20).min()
+    # === VOLATILITY MEASURES ===
+    returns_1d = features['Returns_1d']
+    for window in [5, 10, 20, 60]:
+        features[f'Volatility_{window}d'] = returns_1d.rolling(window, min_periods=window).std()
 
-    # --- Parabolic SAR (simple version) ---
-    # This is a basic implementation, for more accuracy use TA-Lib or similar
-    sar_values = np.full(len(df), np.nan)
-    af = 0.02
-    max_af = 0.2
-    trend = 1  # 1 for up, -1 for down
-    ep = df['Low'].iloc[0]
-    sar = df['High'].iloc[0]
-    for i in range(2, len(df)):
-        prev_sar = sar
-        if trend == 1:
-            sar = prev_sar + af * (ep - prev_sar)
-            if df['Low'].iloc[i] < sar:
-                trend = -1
-                sar = ep
-                ep = df['High'].iloc[i]
-                af = 0.02
-            else:
-                if df['High'].iloc[i] > ep:
-                    ep = df['High'].iloc[i]
-                    af = min(af + 0.02, max_af)
-        else:
-            sar = prev_sar + af * (ep - prev_sar)
-            if df['High'].iloc[i] > sar:
-                trend = 1
-                sar = ep
-                ep = df['Low'].iloc[i]
-                af = 0.02
-            else:
-                if df['Low'].iloc[i] < ep:
-                    ep = df['Low'].iloc[i]
-                    af = min(af + 0.02, max_af)
-        sar_values[i] = sar
-    features['SAR'] = pd.Series(sar_values, index=df.index)
+    # === TRUE RANGE & ATR ===
+    # Calculate True Range using properly lagged previous close
+    features['prev_close'] = prev_close
+    tr1 = df['High'] - df['Low']
+    tr2 = abs(df['High'] - prev_close)
+    tr3 = abs(df['Low'] - prev_close)
+    features['TR'] = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
 
-    # --- Accumulation/Distribution Line (ADL) ---
-    clv = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low'] + 1e-10)
-    features['ADL'] = (clv * df['Volume']).cumsum()
+    for period in [7, 14, 21]:
+        features[f'ATR_{period}'] = features['TR'].rolling(period, min_periods=period).mean()
 
-    # (Fibonacci features removed)
+    # ATR-based features
+    if 'ATR_14' in features:
+        features['ATR_ratio'] = features['ATR_14'] / (prev_close + 1e-10)
+        atr_quantile = features['ATR_14'].rolling(20, min_periods=20).quantile(0.8)
+        features['High_Vol_Flag'] = (features['ATR_14'] > atr_quantile).astype(int)
 
-    # --- FIXED: All features now use only past/current data ---
-
-    # Lag features (safe - using past data)
-    features['lag1_Close'] = df['Close'].shift(1)
-    features['lag2_Close'] = df['Close'].shift(2)
-    features['lag3_Close'] = df['Close'].shift(3)
-
-    # Moving averages (safe - using past data only)
-    features['MA5'] = df['Close'].rolling(5, min_periods=5).mean()
-    features['MA9'] = df['Close'].rolling(9, min_periods=9).mean()
-    features['MA10'] = df['Close'].rolling(10, min_periods=10).mean()
-    features['MA20'] = df['Close'].rolling(20, min_periods=20).mean()
-    features['MA21'] = df['Close'].rolling(21, min_periods=21).mean()
-    features['MA50'] = df['Close'].rolling(50, min_periods=50).mean()
-    # --- Z-score of price relative to MA20 (strictly causal implementation) ---
-    features['Zscore_Close_MA20'] = (df['Close'] - features['MA20']) / (
-        df['Close'].rolling(20, min_periods=20).apply(
-            lambda x: np.std(x[:-1]), raw=True  # Use only past values in the window
-        ) + 1e-10
-    )
-    # --- Slope of MA20 (trend strength alternative) ---
-    features['MA20_Slope'] = features['MA20'].diff(5) / 5
-
-    # Price ratios to moving averages
-    features['Price_to_MA5'] = df['Close'] / features['MA5'] - 1
-    features['Price_to_MA10'] = df['Close'] / features['MA10'] - 1
-    features['Price_to_MA20'] = df['Close'] / features['MA20'] - 1
-    features['MA9_MA21_Ratio'] = features['MA9'] / features['MA21']
-
-    # Returns (safe - using past prices)
-    features['Returns_1d'] = df['Close'].pct_change(1)
-    features['Returns_2d'] = df['Close'].pct_change(2)
-    features['Returns_3d'] = df['Close'].pct_change(3)
-    features['Returns_5d'] = df['Close'].pct_change(5)
-    features['Returns_10d'] = df['Close'].pct_change(10)
-
-    # Volatility (safe - using past returns)
-    features['Volatility_5d'] = features['Returns_1d'].rolling(5, min_periods=5).std()
-    features['Volatility_10d'] = features['Returns_1d'].rolling(10, min_periods=10).std()
-    features['Volatility_20d'] = features['Returns_1d'].rolling(20, min_periods=20).std()
-
-    # ATR and related features
-    features['prev_close'] = df['Close'].shift(1)
-    features['TR'] = np.maximum(df['High'] - df['Low'],
-                          np.maximum(abs(df['High'] - features['prev_close']),
-                                     abs(df['Low'] - features['prev_close'])))
-    features['ATR'] = features['TR'].rolling(14, min_periods=14).mean()
-    features['ATR_14'] = features['ATR']
-    features['ATR_ratio'] = features['ATR_14'] / df['Close']
-
-    # High volatility flag
-    features['ATR_20d_quantile'] = features['ATR'].rolling(20, min_periods=20).quantile(0.8)
-    features['High_Vol_Flag'] = (features['ATR'] > features['ATR_20d_quantile']).astype(int)
-
-    # Bollinger Bands
-    features['BB_middle'] = df['Close'].rolling(20, min_periods=20).mean()
-    features['BB_std'] = df['Close'].rolling(20, min_periods=20).std()
-    features['BB_upper'] = features['BB_middle'] + 2 * features['BB_std']
-    features['BB_lower'] = features['BB_middle'] - 2 * features['BB_std']
-    features['BB_position'] = (df['Close'] - features['BB_lower']) / (features['BB_upper'] - features['BB_lower'])
-    features['BB_Width'] = features['BB_upper'] - features['BB_lower']
-    features['BB_squeeze'] = features['BB_std'] / features['BB_middle']
-
-    # RSI (safe - using past price changes)
-    delta = df['Close'].diff()
+    # === RSI (Properly calculated with lagged data) ===
+    rsi_period = 14
+    delta = prev_close.diff()  # Change from previous to previous-previous
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(14, min_periods=14).mean()
-    avg_loss = loss.rolling(14, min_periods=14).mean()
+
+    avg_gain = gain.rolling(rsi_period, min_periods=rsi_period).mean()
+    avg_loss = loss.rolling(rsi_period, min_periods=rsi_period).mean()
     rs = avg_gain / (avg_loss + 1e-10)
     features['RSI'] = 100 - (100 / (1 + rs))
+
+    # RSI-based flags
     features['RSI_oversold'] = (features['RSI'] < 30).astype(int)
     features['RSI_overbought'] = (features['RSI'] > 70).astype(int)
 
-    # MACD (safe - using past prices)
-    ema_12 = df['Close'].ewm(span=12, min_periods=12).mean()
-    ema_26 = df['Close'].ewm(span=26, min_periods=26).mean()
-    features['MACD'] = ema_12 - ema_26
-    features['Signal_Line'] = features['MACD'].ewm(span=9, min_periods=9).mean()
-    features['MACD_histogram'] = features['MACD'] - features['Signal_Line']
-    features['MACD_bullish'] = (features['MACD'] > features['Signal_Line']).astype(int)
+    # === BOLLINGER BANDS (Properly lagged) ===
+    bb_period = 20
+    features['BB_middle'] = prev_close.rolling(bb_period, min_periods=bb_period).mean()
+    bb_std = prev_close.rolling(bb_period, min_periods=bb_period).std()
+    features['BB_std'] = bb_std
+    features['BB_upper'] = features['BB_middle'] + 2 * bb_std
+    features['BB_lower'] = features['BB_middle'] - 2 * bb_std
 
-    # Crossover signals (safe - comparing current to previous)
-    features['MACD_Signal_crossover'] = np.where(
-        (features['MACD'] > features['Signal_Line']) & (features['MACD'].shift(1) <= features['Signal_Line'].shift(1)), 1,
-        np.where((features['MACD'] < features['Signal_Line']) & (features['MACD'].shift(1) >= features['Signal_Line'].shift(1)), -1, 0)
+    # BB position and width
+    bb_range = features['BB_upper'] - features['BB_lower']
+    features['BB_position'] = (prev_close - features['BB_lower']) / (bb_range + 1e-10)
+    features['BB_Width'] = bb_range
+    features['BB_squeeze'] = bb_std / (features['BB_middle'] + 1e-10)
+
+    # === MACD (Properly lagged) ===
+    if 'EMA12' in features and 'EMA26' in features:
+        features['MACD'] = features['EMA12'] - features['EMA26']
+        features['Signal_Line'] = features['MACD'].ewm(span=9, min_periods=9).mean()
+        features['MACD_histogram'] = features['MACD'] - features['Signal_Line']
+        features['MACD_bullish'] = (features['MACD'] > features['Signal_Line']).astype(int)
+
+        # MACD crossover signals
+        macd_cross_up = ((features['MACD'] > features['Signal_Line']) &
+                        (features['MACD'].shift(1) <= features['Signal_Line'].shift(1))).astype(int)
+        macd_cross_down = ((features['MACD'] < features['Signal_Line']) &
+                          (features['MACD'].shift(1) >= features['Signal_Line'].shift(1))).astype(int)
+        features['MACD_Signal_crossover'] = macd_cross_up - macd_cross_down
+
+    # === STOCHASTIC OSCILLATOR (Fixed to use lagged data) ===
+    stoch_period = 14
+    # Use lagged high/low for the lookback period
+    lowest_low = prev_low.rolling(stoch_period, min_periods=stoch_period).min()
+    highest_high = prev_high.rolling(stoch_period, min_periods=stoch_period).max()
+
+    features['Stoch_K'] = 100 * ((prev_close - lowest_low) / (highest_high - lowest_low + 1e-10))
+    features['Stoch_D'] = features['Stoch_K'].rolling(3, min_periods=3).mean()
+
+    # === WILLIAMS %R (Fixed) ===
+    features['Williams_R'] = -100 * ((highest_high - prev_close) / (highest_high - lowest_low + 1e-10))
+
+    # === CCI (Fixed to use lagged data) ===
+    cci_period = 20
+    typical_price = (prev_high + prev_low + prev_close) / 3
+    tp_ma = typical_price.rolling(cci_period, min_periods=cci_period).mean()
+    mean_deviation = typical_price.rolling(cci_period, min_periods=cci_period).apply(
+        lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
     )
+    features['CCI'] = (typical_price - tp_ma) / (0.015 * mean_deviation + 1e-10)
 
-    features['MA9_21_crossover'] = np.where(
-        (features['MA9'] > features['MA21']) & (features['MA9'].shift(1) <= features['MA21'].shift(1)), 1,
-        np.where((features['MA9'] < features['MA21']) & (features['MA9'].shift(1) >= features['MA21'].shift(1)), -1, 0)
-    )
+    # === VOLUME-BASED INDICATORS (All lagged) ===
 
-    # Volume features (safe - using past volume data)
-    features['Volume_MA_5'] = df['Volume'].rolling(5, min_periods=5).mean()
-    features['Volume_MA_20'] = df['Volume'].rolling(20, min_periods=20).mean()
-    features['Volume_ratio'] = df['Volume'] / features['Volume_MA_20']
-    features['Volume_trend'] = features['Volume_MA_5'] / features['Volume_MA_20']
+    # Volume moving averages
+    for period in [5, 20, 50]:
+        features[f'Volume_MA_{period}'] = prev_volume.rolling(period, min_periods=period).mean()
 
-    # Price action patterns (safe - using past prices)
-    features['Higher_high'] = ((df['High'] > df['High'].shift(1)) &
-                        (df['High'].shift(1) > df['High'].shift(2))).astype(int)
-    features['Lower_low'] = ((df['Low'] < df['Low'].shift(1)) &
-                      (df['Low'].shift(1) < df['Low'].shift(2))).astype(int)
+    # Volume ratios
+    if 'Volume_MA_20' in features:
+        features['Volume_ratio'] = prev_volume / (features['Volume_MA_20'] + 1e-10)
+    if 'Volume_MA_5' in features and 'Volume_MA_20' in features:
+        features['Volume_trend'] = features['Volume_MA_5'] / (features['Volume_MA_20'] + 1e-10)
 
-    # Gap detection (safe - comparing current open to previous close)
-    features['Gap_up'] = (df['Open'] > features['prev_close'] * 1.02).astype(int)
-    features['Gap_down'] = (df['Open'] < features['prev_close'] * 0.98).astype(int)
+    # On-Balance Volume (OBV)
+    price_direction = np.sign(prev_close.diff())
+    features['OBV'] = (price_direction * prev_volume).fillna(0).cumsum()
 
-    # Momentum indicators (safe - using past prices)
-    features['Momentum_5'] = df['Close'] / df['Close'].shift(5) - 1
-    features['Momentum_10'] = df['Close'] / df['Close'].shift(10) - 1
+    # Chaikin Money Flow (CMF)
+    money_flow_multiplier = ((prev_close - prev_low) - (prev_high - prev_close)) / (prev_high - prev_low + 1e-10)
+    money_flow_volume = money_flow_multiplier * prev_volume
+    cmf_period = 21
+    features['CMF'] = (money_flow_volume.rolling(cmf_period, min_periods=cmf_period).sum() /
+                      prev_volume.rolling(cmf_period, min_periods=cmf_period).sum())
 
-    # --- Relative Strength vs. Sector ETF and SPY ---
-    if 'Sector_Close' in df.columns:
-        features['TSLA_to_Sector'] = df['Close'] / df['Sector_Close']
-        features['Sector_Return'] = df['Sector_Close'].pct_change()
-        features['Sector_MA50'] = df['Sector_Close'].rolling(50, min_periods=50).mean()
-        features['Sector_Momentum_5'] = df['Sector_Close'] / df['Sector_Close'].shift(5) - 1
-        features['Relative_Momentum_Sector'] = features['Momentum_5'] - features['Sector_Momentum_5']
-    if 'SPY_Close' in df.columns:
-        features['TSLA_to_SPY'] = df['Close'] / df['SPY_Close']
-        features['SPY_Return'] = df['SPY_Close'].pct_change()
-        features['SPY_MA50'] = df['SPY_Close'].rolling(50, min_periods=50).mean()
-        features['SPY_Momentum_5'] = df['SPY_Close'] / df['SPY_Close'].shift(5) - 1
-        features['Relative_Momentum_SPY'] = features['Momentum_5'] - features['SPY_Momentum_5']
+    # === MOMENTUM INDICATORS ===
+    for period in [5, 10, 20]:
+        features[f'Momentum_{period}'] = (prev_close / prev_close.shift(period)) - 1
 
-    # Support/Resistance levels (safe - using past high/low data)
-    features['High_20d'] = df['High'].rolling(20, min_periods=20).max()
-    features['Low_20d'] = df['Low'].rolling(20, min_periods=20).min()
-    features['Near_20d_high'] = (df['Close'] > features['High_20d'] * 0.98).astype(int)
-    features['Near_20d_low'] = (df['Close'] < features['Low_20d'] * 1.02).astype(int)
+    # === SUPERTREND ===
+    supertrend_val, supertrend_dir = supertrend(df, atr_period=10, factor=3.0)
+    features['Supertrend_Direction'] = supertrend_dir.shift(1)  # Lag by 1 to prevent lookahead
 
-    # Time-based features (safe - using current date)
+    # === ADVANCED PATTERN FEATURES ===
+    pattern_features = create_advanced_pattern_features(df)
+    features.update(pattern_features)
+
+    # === SUPPORT/RESISTANCE LEVELS (Lagged) ===
+    for period in [10, 20, 50]:
+        features[f'High_{period}d'] = prev_high.rolling(period, min_periods=period).max()
+        features[f'Low_{period}d'] = prev_low.rolling(period, min_periods=period).min()
+
+    # Distance from support/resistance
+    if 'High_20d' in features and 'Low_20d' in features:
+        features['Near_20d_high'] = (prev_close > features['High_20d'] * 0.98).astype(int)
+        features['Near_20d_low'] = (prev_close < features['Low_20d'] * 1.02).astype(int)
+
+    # === PRICE ACTION PATTERNS (All lagged) ===
+    features['Higher_high'] = ((prev_high > prev_high.shift(1)) &
+                              (prev_high.shift(1) > prev_high.shift(2))).astype(int)
+    features['Lower_low'] = ((prev_low < prev_low.shift(1)) &
+                            (prev_low.shift(1) < prev_low.shift(2))).astype(int)
+
+    # Gap detection (comparing current open to previous close - this is valid)
+    features['Gap_up'] = (df['Open'] > prev_close * 1.02).astype(int)
+    features['Gap_down'] = (df['Open'] < prev_close * 0.98).astype(int)
+
+    # Intraday price action (using lagged OHLC)
+    features['Close_to_High'] = prev_close / (prev_high + 1e-10)
+    features['Close_to_Low'] = prev_close / (prev_low + 1e-10)
+    features['High_Low_ratio'] = prev_high / (prev_low + 1e-10)
+
+    # Candlestick body and shadow analysis
+    features['Body_size'] = abs(prev_close - prev_open) / (prev_open + 1e-10)
+    features['Upper_shadow'] = (prev_high - np.maximum(prev_open, prev_close)) / (prev_close + 1e-10)
+    features['Lower_shadow'] = (np.minimum(prev_open, prev_close) - prev_low) / (prev_close + 1e-10)
+
+    # === TIME-BASED FEATURES ===
     features['Day_of_week'] = df.index.dayofweek
     features['Month'] = df.index.month
     features['Is_month_end'] = df.index.is_month_end.astype(int)
     features['Is_friday'] = (df.index.dayofweek == 4).astype(int)
     features['Is_monday'] = (df.index.dayofweek == 0).astype(int)
+    features['Is_quarter_end'] = df.index.is_quarter_end.astype(int)
 
-    # Market regime features (safe - using past trend data)
-    features['Bull_market'] = (features['MA50'] > features['MA50'].shift(10)).astype(int)
-    # Use the already created MA20 (consistent naming)
-    features['Price_to_MA_20'] = df['Close'] / features['MA20'] - 1
-    features['Trend_strength'] = abs(features['Price_to_MA_20'])
+    # === MARKET REGIME FEATURES ===
+    if 'MA50' in features:
+        features['Bull_market'] = (features['MA50'] > features['MA50'].shift(10)).astype(int)
+        if 'MA20' in features:
+            features['Trend_strength'] = abs(prev_close / (features['MA20'] + 1e-10) - 1)
 
-    # Additional safe features
-    features['Close_to_High'] = df['Close'] / df['High']
-    features['Close_to_Low'] = df['Close'] / df['Low']
-    features['High_Low_ratio'] = df['High'] / df['Low']
-    features['Body_size'] = abs(df['Close'] - df['Open']) / df['Open']
-    features['Upper_shadow'] = (df['High'] - np.maximum(df['Open'], df['Close'])) / df['Close']
-    features['Lower_shadow'] = (np.minimum(df['Open'], df['Close']) - df['Low']) / df['Close']
+    # === Z-SCORE FEATURES (Properly calculated) ===
+    if 'MA20' in features:
+        rolling_std = prev_close.rolling(20, min_periods=20).std()
+        features['Zscore_Close_MA20'] = (prev_close - features['MA20']) / (rolling_std + 1e-10)
 
-    # --- Stage 2: Features that depend on Stage 1 features or earlier ---
-    # 📉 Momentum × RSI / MACD
-    features['RSI_Momentum_5'] = features['RSI'] * features['Momentum_5']
-    features['RSI_Momentum_10'] = features['RSI'] * features['Momentum_10']
-    features['MACD_RSI_Interaction'] = features['MACD_histogram'] * features['RSI']
-    features['MACD_Signal_Gap'] = features['MACD_histogram'] - features['Signal_Line']
-    # 📊 Volatility × Price Action
-    features['Volatility_Returns'] = features['Volatility_5d'] * features['Returns_3d']
-    features['BBWidth_to_MA'] = features['BB_Width'] / (abs(features['Price_to_MA_20']) + 1e-6)
-    features['Volatility_Shadow'] = features['Volatility_10d'] * features['Upper_shadow']
-    # 🔀 Price to MA Interactions
-    features['MA9_21_Combo'] = features['Price_to_MA10'] * features['MA9_MA21_Ratio']
-    features['MA9_Momentum'] = features['Price_to_MA5'] * features['Momentum_5']
-    features['BB_Squeeze_MA20'] = features['BB_squeeze'] * features['Price_to_MA_20']
+    # MA slope (trend direction)
+    if 'MA20' in features:
+        features['MA20_Slope'] = features['MA20'].diff(5) / 5
 
-    # --- Additional classic engineered combos from features.py ---
-    features['Friday_Momentum'] = features['Is_friday'] * features['Momentum_5']
-    features['Monday_GapUp'] = features['Is_monday'] * features['Gap_up']
-    features['Month_MA_ratio'] = features['Month'] * features['MA9_MA21_Ratio']
-    features['Volume_Momentum'] = features['Volume_ratio'] * features['Momentum_5']
-    features['Volume_Volatility'] = features['Volume_ratio'] * features['Volatility_5d']
-    features['Volume_Shadow'] = features['Volume_ratio'] * (features['Upper_shadow'] + features['Lower_shadow'])
-    features['NearHigh_Momentum'] = features['Near_20d_high'] * features['Momentum_10']
-    features['NearLow_GapDown'] = features['Near_20d_low'] * features['Gap_down']
-    features['ResistanceBreakout'] = features['Near_20d_high'] * features['Price_to_MA5']
-    features['Bull_RSI'] = features['Bull_market'] * features['RSI']
-    features['HighVol_GapUp'] = features['High_Vol_Flag'] * features['Gap_up']
-    features['Oversold_Body'] = features['RSI_oversold'] * features['Body_size']
-    features['ATR_vs_BodySize'] = features['ATR_ratio'] / (features['Body_size'] + 1e-6)
+    # === SECTOR AND SPY RELATIVE STRENGTH (If available) ===
+    if 'Sector_Close' in df.columns:
+        sector_prev = df['Sector_Close'].shift(1)
+        features['TSLA_to_Sector'] = prev_close / (sector_prev + 1e-10)
+        features['Sector_Return'] = df['Sector_Close'].pct_change()
+        features['Sector_MA50'] = sector_prev.rolling(50, min_periods=50).mean()
 
-    # 🔄 Trend Confirmation Features - Supertrend + Other Indicators
-    # Supertrend + EMA alignment (strong confirmation when both agree)
-    features['Supertrend_EMA_Confirm'] = features['Supertrend_Direction'] * np.sign(features['EMA12_26_diff'])
-    features['Supertrend_EMA_Agree'] = (np.sign(features['EMA12_26_diff']) == features['Supertrend_Direction']).astype(int)
+        # Relative momentum
+        sector_momentum_5 = (sector_prev / sector_prev.shift(5)) - 1
+        if 'Momentum_5' in features:
+            features['Relative_Momentum_Sector'] = features['Momentum_5'] - sector_momentum_5
 
-    # Supertrend + RSI confirmation (trend strength with momentum)
-    features['Supertrend_RSI_Bull'] = (features['Supertrend_Direction'] > 0) & (features['RSI'] > 50)
-    features['Supertrend_RSI_Bear'] = (features['Supertrend_Direction'] < 0) & (features['RSI'] < 50)
-    features['Supertrend_RSI_Confirm'] = features['Supertrend_RSI_Bull'].astype(int) - features['Supertrend_RSI_Bear'].astype(int)
+    if 'SPY_Close' in df.columns:
+        spy_prev = df['SPY_Close'].shift(1)
+        features['TSLA_to_SPY'] = prev_close / (spy_prev + 1e-10)
+        features['SPY_Return'] = df['SPY_Close'].pct_change()
+        features['SPY_MA50'] = spy_prev.rolling(50, min_periods=50).mean()
 
-    # Trend persistence - how long the current Supertrend has maintained direction
-    trend_shifts = features['Supertrend_Direction'].diff().fillna(0) != 0
-    features['Trend_Duration'] = (~trend_shifts).cumsum() * features['Supertrend_Direction']
+        # Relative momentum
+        spy_momentum_5 = (spy_prev / spy_prev.shift(5)) - 1
+        if 'Momentum_5' in features:
+            features['Relative_Momentum_SPY'] = features['Momentum_5'] - spy_momentum_5
 
-    # Volatility-adjusted Supertrend signal (stronger in low volatility)
-    features['Supertrend_Vol_Adj'] = features['Supertrend_Direction'] / (features['Volatility_20d'] + 0.001)
-    # 🕰️ Time Features × Price Action
-    features['Friday_Momentum'] = features['Is_friday'] * features['Momentum_5']
-    features['Monday_GapUp'] = features['Is_monday'] * features['Gap_up']
-    features['Month_MA_ratio'] = features['Month'] * features['MA9_MA21_Ratio']
+    # === ADX (Average Directional Index) ===
+    # Calculate using lagged data to prevent lookahead
+    up_move = prev_high.diff()
+    down_move = -prev_low.diff()
 
-    # 🕰️ Supertrend Time Interactions
-    features['Monday_Supertrend'] = features['Is_monday'] * features['Supertrend_Direction']
-    features['Friday_Supertrend'] = features['Is_friday'] * features['Supertrend_Direction']
-    features['Month_Supertrend'] = features['Is_month_end'] * features['Supertrend_Direction']
-    # 📈 Volume Behavior
-    features['Volume_Momentum'] = features['Volume_ratio'] * features['Momentum_5']
-    features['Volume_Volatility'] = features['Volume_ratio'] * features['Volatility_5d']
-    features['Volume_Shadow'] = features['Volume_ratio'] * (features['Upper_shadow'] + features['Lower_shadow'])
-    # 🔁 Support/Resistance × Momentum
-    features['NearHigh_Momentum'] = features['Near_20d_high'] * features['Momentum_10']
-    features['NearLow_GapDown'] = features['Near_20d_low'] * features['Gap_down']
-    features['ResistanceBreakout'] = features['Near_20d_high'] * features['Price_to_MA5']
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
 
-    # 🔁 Support/Resistance × Supertrend (powerful breakout signals)
-    features['Supertrend_Breakout_High'] = (features['Supertrend_Direction'] > 0) & features['Near_20d_high']
-    features['Supertrend_Bounce_Low'] = (features['Supertrend_Direction'] > 0) & features['Near_20d_low']
-    features['Supertrend_Break_Score'] = features['Supertrend_Direction'] * (df['Close'] - features['MA20']) / features['MA20']
+    if 'TR' in features:
+        atr_14 = features['TR'].rolling(14, min_periods=14).mean()
+        plus_di = 100 * plus_dm.rolling(14, min_periods=14).sum() / (atr_14 + 1e-10)
+        minus_di = 100 * minus_dm.rolling(14, min_periods=14).sum() / (atr_14 + 1e-10)
 
-    # 🔒 Boolean Flags × Quantitative Features
-    features['Bull_RSI'] = features['Bull_market'] * features['RSI']
-    features['HighVol_GapUp'] = features['High_Vol_Flag'] * features['Gap_up']
-    features['Oversold_Body'] = features['RSI_oversold'] * features['Body_size']
-    # Features that depend on Stage 1
-    features['ATR_vs_BodySize'] = features['ATR_ratio'] / (features['Body_size'] + 1e-6)
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+        features['ADX'] = dx.rolling(14, min_periods=14).mean()
 
-    # 🌟 Multi-Signal Confirmation Systems
-    # Signal strength index - combining multiple technical signals
-    features['Signal_Strength'] = (
-        (features['RSI'] > 50).astype(int) +
-        (features['Supertrend_Direction'] > 0).astype(int) +
-        (features['MA9'] > features['MA21']).astype(int) +
-        (features['MACD'] > features['Signal_Line']).astype(int) +
-        (df['Close'] > features['BB_middle']).astype(int)
-    ) / 5.0  # Normalized to 0-1
+    # === DONCHIAN CHANNELS ===
+    for period in [20, 50]:
+        features[f'Donchian_High_{period}'] = prev_high.rolling(period, min_periods=period).max()
+        features[f'Donchian_Low_{period}'] = prev_low.rolling(period, min_periods=period).min()
+        features[f'Donchian_Mid_{period}'] = (features[f'Donchian_High_{period}'] + features[f'Donchian_Low_{period}']) / 2
 
-    # Divergence detection - price making new highs but indicators not confirming
-    features['RSI_Price_Divergence'] = (df['Close'] > df['Close'].shift(5)) & (features['RSI'] < features['RSI'].shift(5))
+    # === PARABOLIC SAR (Simple implementation) ===
+    sar_values = pd.Series(np.full(len(df), np.nan), index=df.index)
+    if len(df) >= 3:
+        af = 0.02
+        max_af = 0.2
+        trend = 1
+        ep = prev_low.iloc[0] if not pd.isna(prev_low.iloc[0]) else df['Low'].iloc[0]
+        sar = prev_high.iloc[0] if not pd.isna(prev_high.iloc[0]) else df['High'].iloc[0]
 
-    # Supertrend-enhanced pattern strength
-    features['Trend_Pattern_Strength'] = features['Supertrend_Direction'] * features['Signal_Strength'] * (1 + abs(features['Momentum_5']))
+        for i in range(2, len(df)):
+            prev_sar = sar
+            curr_high = prev_high.iloc[i] if not pd.isna(prev_high.iloc[i]) else df['High'].iloc[i-1]
+            curr_low = prev_low.iloc[i] if not pd.isna(prev_low.iloc[i]) else df['Low'].iloc[i-1]
 
-    # Combine all features at once to avoid fragmentation
+            if trend == 1:
+                sar = prev_sar + af * (ep - prev_sar)
+                if curr_low < sar:
+                    trend = -1
+                    sar = ep
+                    ep = curr_high
+                    af = 0.02
+                else:
+                    if curr_high > ep:
+                        ep = curr_high
+                        af = min(af + 0.02, max_af)
+            else:
+                sar = prev_sar + af * (ep - prev_sar)
+                if curr_high > sar:
+                    trend = 1
+                    sar = ep
+                    ep = curr_low
+                    af = 0.02
+                else:
+                    if curr_low < ep:
+                        ep = curr_low
+                        af = min(af + 0.02, max_af)
+            sar_values.iloc[i] = sar
+
+    features['SAR'] = sar_values.shift(1)  # Lag SAR by 1 to prevent lookahead
+
+    # === ACCUMULATION/DISTRIBUTION LINE ===
+    clv = ((prev_close - prev_low) - (prev_high - prev_close)) / (prev_high - prev_low + 1e-10)
+    features['ADL'] = (clv * prev_volume).cumsum()
+
+    # === CROSSOVER SIGNALS (Safe - comparing lagged values) ===
+    if 'MA9' in features and 'MA21' in features:
+        ma9_cross_up = ((features['MA9'] > features['MA21']) &
+                       (features['MA9'].shift(1) <= features['MA21'].shift(1))).astype(int)
+        ma9_cross_down = ((features['MA9'] < features['MA21']) &
+                         (features['MA9'].shift(1) >= features['MA21'].shift(1))).astype(int)
+        features['MA9_21_crossover'] = ma9_cross_up - ma9_cross_down
+
+    # === STATISTICAL FEATURES ===
+
+    # Price percentile ranks
+    for period in [10, 20, 50]:
+        features[f'Price_Percentile_{period}d'] = prev_close.rolling(period, min_periods=period).rank(pct=True)
+        features[f'Volume_Percentile_{period}d'] = prev_volume.rolling(period, min_periods=period).rank(pct=True)
+
+    # Price velocity (rate of change acceleration)
+    if 'Returns_1d' in features:
+        features['Price_Velocity'] = features['Returns_1d'].diff()
+        features['Price_Acceleration'] = features['Price_Velocity'].diff()
+
+    # === REGIME CHANGE DETECTION ===
+
+    # Volatility regime changes
+    if 'Volatility_20d' in features:
+        vol_ma = features['Volatility_20d'].rolling(10, min_periods=10).mean()
+        features['Vol_Regime_Change'] = (features['Volatility_20d'] > vol_ma * 1.5).astype(int)
+
+    # Trend regime changes
+    if 'MA20_Slope' in features:
+        trend_change = abs(features['MA20_Slope'].diff()) > features['MA20_Slope'].rolling(20).std()
+        features['Trend_Regime_Change'] = trend_change.astype(int)
+
+    # === MARKET MICROSTRUCTURE FEATURES ===
+
+    # Price efficiency (how much price moves relative to volume)
+    if 'Returns_1d' in features:
+        features['Price_Efficiency'] = abs(features['Returns_1d']) / (np.log(prev_volume + 1) + 1e-10)
+
+    # Volume-weighted features
+    if 'Volume_MA_20' in features:
+        vwap_num = (prev_close * prev_volume).rolling(20, min_periods=20).sum()
+        vwap_den = prev_volume.rolling(20, min_periods=20).sum()
+        features['VWAP_20'] = vwap_num / (vwap_den + 1e-10)
+        features['Price_to_VWAP'] = prev_close / (features['VWAP_20'] + 1e-10) - 1
+
+    # === INTERACTION FEATURES ===
+
+    # Volume-price interaction
+    if 'Returns_1d' in features and 'Volume_ratio' in features:
+        features['Volume_Price_Interaction'] = features['Returns_1d'] * features['Volume_ratio']
+
+    # Volatility-momentum interaction
+    if 'Volatility_10d' in features and 'Momentum_5' in features:
+        features['Vol_Momentum_Interaction'] = features['Volatility_10d'] * abs(features['Momentum_5'])
+
+    # RSI-price interaction
+    if 'RSI' in features:
+        features['RSI_Price_Interaction'] = features['RSI'] * (prev_close / features.get('MA20', prev_close))
+
+    # === FEATURE QUALITY CONTROLS ===
+
+    # Replace infinite values
+    for key in features:
+        if isinstance(features[key], pd.Series):
+            features[key] = features[key].replace([np.inf, -np.inf], np.nan)
+
+    # Combine all features with original DataFrame
     new_features_df = pd.DataFrame(features, index=df.index)
     result_df = pd.concat([df, new_features_df], axis=1)
+
+    print(f"Feature engineering complete. Added {len(features)} new features.")
 
     return result_df
 
 def select_features(df):
-    """Select the most predictive features - only non-leaky ones"""
-    import os
+    """Enhanced feature selection focusing on non-leaky, predictive features"""
 
-    # Safety check - if df is empty or None, return empty DataFrame
     if df is None or len(df) == 0:
-        print("WARNING: Empty dataframe passed to select_features. Returning empty DataFrame.")
         return pd.DataFrame()
 
-    # Ensure debug directory exists
-    os.makedirs("tesla_stock_predictor/debug", exist_ok=True)
+    try:
+        os.makedirs("debug", exist_ok=True)
+    except:
+        pass
 
-    # Define feature categories and their patterns
+    # Define feature categories with enhanced patterns
     feature_patterns = {
-        'lag': ['lag1_Close', 'lag2_Close', 'lag3_Close'],
-        'returns': [col for col in df.columns if 'Returns_' in col or 'Momentum_' in col],
-        'ma_ratios': [col for col in df.columns if 'Price_to_MA' in col or 'MA9_MA21_Ratio' in col],
-        'volatility': [col for col in df.columns if 'Volatility_' in col or 'ATR' in col],
-        'bollinger': [col for col in df.columns if 'BB_' in col],
-        'rsi': [col for col in df.columns if 'RSI' in col],
-        'macd': [col for col in df.columns if 'MACD' in col or 'Signal_Line' in col],
-        'crossovers': [col for col in df.columns if 'crossover' in col],
-        'volume': [col for col in df.columns if 'Volume_' in col],
-        'patterns': ['Higher_high', 'Lower_low', 'Gap_up', 'Gap_down'],
-        'support_resistance': ['Near_20d_high', 'Near_20d_low', 'High_20d', 'Low_20d'],
-        'time': ['Day_of_week', 'Month', 'Is_month_end', 'Is_friday', 'Is_monday'],
-        'market_regime': ['Bull_market', 'Trend_strength', 'High_Vol_Flag'],
-        'price_action': [col for col in df.columns if any(x in col for x in ['Close_to_', 'High_Low_ratio', 'Body_size', 'shadow'])],
-        'interactions': [col for col in df.columns if any(x in col for x in ['_Momentum', '_Interaction', '_Gap', '_Returns', '_BodySize', '_MA', '_Shadow', '_GapUp', '_GapDown', '_RSI', '_Vol'])],
-        # Advanced technical indicators
-        'ema': [col for col in df.columns if 'EMA' in col],
-        'stoch': [col for col in df.columns if 'Stoch_%K' in col or 'Stoch_%D' in col],
-        'williams': [col for col in df.columns if 'Williams_%R' in col],
-        'cci': [col for col in df.columns if 'CCI' in col],
-        'obv': [col for col in df.columns if 'OBV' in col],
-        'cmf': [col for col in df.columns if 'CMF' in col],
-        'adx': [col for col in df.columns if 'ADX' in col],
-        'donchian': [col for col in df.columns if 'Donchian_' in col],
-        'sar': [col for col in df.columns if 'SAR' in col],
-        'zscore': [col for col in df.columns if 'Zscore' in col],
-        'adl': [col for col in df.columns if 'ADL' in col],
-        'slope': [col for col in df.columns if 'Slope' in col],
-        # Sector/relative features
-        'sector': [col for col in df.columns if 'Sector_' in col or 'TSLA_to_Sector' in col or 'Relative_Momentum_Sector' in col],
-        'spy': [col for col in df.columns if 'SPY_' in col or 'TSLA_to_SPY' in col or 'Relative_Momentum_SPY' in col],
+        'basic_technical': [
+            # Moving averages and ratios
+            'MA5', 'MA9', 'MA10', 'MA20', 'MA21', 'MA50', 'MA200',
+            'EMA12', 'EMA26', 'EMA50', 'EMA200',
+            'EMA12_26_diff', 'EMA12_50_diff', 'EMA50_200_diff',
+            'MA9_MA21_Ratio', 'MA20_Slope'
+        ],
+        'price_action': [
+            # Price relationships and patterns
+            col for col in df.columns if any(x in col for x in [
+                'Price_to_MA', 'Close_to_', 'Body_size', 'shadow',
+                'Higher_high', 'Lower_low', 'Gap_'
+            ])
+        ],
+        'momentum': [
+            # Returns and momentum
+            col for col in df.columns if any(x in col for x in [
+                'Returns_', 'Momentum_', 'Price_Velocity', 'Price_Acceleration'
+            ])
+        ],
+        'volatility': [
+            # Volatility measures
+            col for col in df.columns if any(x in col for x in [
+                'Volatility_', 'ATR', 'BB_', 'Vol_'
+            ])
+        ],
+        'oscillators': [
+            # Technical oscillators
+            'RSI', 'RSI_oversold', 'RSI_overbought', 'RSI_Momentum',
+            'Stoch_K', 'Stoch_D', 'Williams_R', 'CCI'
+        ],
+        'volume': [
+            # Volume-based features
+            col for col in df.columns if any(x in col for x in [
+                'Volume_', 'OBV', 'CMF', 'ADL', 'VWAP'
+            ])
+        ],
+        'advanced_patterns': [
+            # Advanced pattern recognition features
+            col for col in df.columns if any(x in col for x in [
+                'Confluence', 'Momentum_Alignment', 'Divergence', 'Regime',
+                'Pattern', 'Breakout', 'Support_Test', 'Resistance_Test',
+                'Unusual_', 'Bullish_Volume', 'Bearish_Volume'
+            ])
+        ],
+        'statistical': [
+            # Statistical features
+            col for col in df.columns if any(x in col for x in [
+                'Percentile', 'Rank', 'Zscore', 'Efficiency'
+            ])
+        ],
+        'support_resistance': [
+            # Support/resistance levels
+            col for col in df.columns if any(x in col for x in [
+                'High_', 'Low_', 'Near_', 'Distance_From', 'Donchian'
+            ])
+        ],
+        'crossovers': [
+            # Crossover signals
+            col for col in df.columns if 'crossover' in col
+        ],
+        'macd': [
+            # MACD family
+            'MACD', 'Signal_Line', 'MACD_histogram', 'MACD_bullish'
+        ],
+        'supertrend': [
+            'Supertrend_Direction'
+        ],
+        'time_features': [
+            'Day_of_week', 'Month', 'Is_month_end', 'Is_friday', 'Is_monday', 'Is_quarter_end'
+        ],
+        'relative_strength': [
+            # Relative to market/sector
+            col for col in df.columns if any(x in col for x in [
+                'Sector_', 'SPY_', 'Relative_Momentum'
+            ])
+        ],
+        'interactions': [
+            # Feature interactions
+            col for col in df.columns if 'Interaction' in col
+        ],
+        'microstructure': [
+            # Market microstructure
+            col for col in df.columns if any(x in col for x in [
+                'Intraday_Strength', 'Price_Efficiency', 'Gap_Fill'
+            ])
+        ]
     }
 
-    # Flatten all feature patterns into a single list
-    feature_cols = []
+    # Collect all features
+    all_feature_cols = []
     for category, patterns in feature_patterns.items():
         if isinstance(patterns, list) and len(patterns) > 0:
-            if isinstance(patterns[0], str) and not any(col in df.columns for col in patterns):
-                feature_cols.extend(patterns)
+            if isinstance(patterns[0], str) and not patterns[0].startswith('col for col'):
+                # Direct feature names
+                all_feature_cols.extend(patterns)
             else:
-                feature_cols.extend(patterns)
+                # Pattern-based features (already collected)
+                all_feature_cols.extend(patterns)
 
-    # Remove duplicates and ensure all features exist in df, and sort for deterministic order
-    feature_cols = sorted(set(feature_cols))
+    # Remove duplicates and filter by availability
     available_features = []
+    seen = set()
 
-    for col in feature_cols:
-        if col in df.columns:
-            if df[col].notna().sum() > len(df) * 0.5:  # At least 50% non-null
+    for col in all_feature_cols:
+        if col not in seen and col in df.columns:
+            # Check if feature has enough non-null values
+            non_null_ratio = df[col].notna().sum() / len(df)
+            if non_null_ratio > 0.3:  # At least 30% non-null
                 available_features.append(col)
+                seen.add(col)
 
-    # Add any remaining engineered features we might have missed
-    engineered_patterns = ['_Combo', '_Flag', '_bullish', '_oversold', '_overbought']
-    for col in df.columns:
-        if any(pattern in col for pattern in engineered_patterns) and col not in available_features:
-            if df[col].notna().sum() > len(df) * 0.5:
-                available_features.append(col)
+    # Add any lag features that weren't caught
+    lag_features = [col for col in df.columns if col.startswith('lag') and col not in seen]
+    for col in lag_features:
+        if df[col].notna().sum() / len(df) > 0.3:
+            available_features.append(col)
 
-    # Sort available_features for deterministic order
-    available_features = sorted(available_features)
+    print(f"Selected {len(available_features)} features from {len(df.columns)} total columns")
 
-    # Ensure critical trend features and missing classics are always included
-    critical_features = [
-        "Supertrend_Direction",
-        "Supertrend_EMA_Confirm",
-        "Supertrend_RSI_Confirm",
-        "Trend_Duration",
-        "Signal_Strength",
-        "Trend_Pattern_Strength",
-        # Add missing classic engineered features
-        "MA5",
-        "MA9",
-        "MA10",
-        "MA20",
-        "MA21",
-        "MA50",
-        "BB_Squeeze_MA20",
-        "Monday_Supertrend",
-        "Friday_Supertrend",
-        "Month_Supertrend",
-        "Supertrend_Breakout_High",
-        "Supertrend_Bounce_Low",
-        "Supertrend_Break_Score"
-    ]
-    for col in critical_features:
-        if col in df.columns and col not in available_features:
-            if df[col].notna().sum() > len(df) * 0.5:
-                available_features.append(col)
-    available_features = sorted(available_features)
+    # Create feature DataFrame
+    if available_features:
+        try:
+            feature_df = df[available_features].copy()
+            # Handle any remaining NaN values
+            feature_df = feature_df.fillna(method='ffill').fillna(0) if hasattr(feature_df, 'fillna') else feature_df.fillna(0)
 
-    print(f"📊 Selected {len(available_features)} features out of {len(df.columns)} total columns")
+            # Save feature list for debugging
+            try:
+                with open("debug/selected_features.txt", "w") as f:
+                    f.write("# Selected features by category\n")
+                    f.write(f"# Total: {len(available_features)} features\n\n")
 
-    # Log the selected feature list to a file for reproducibility and debugging
-    try:
-        with open("tesla_stock_predictor/debug/selected_features_latest.txt", "w") as f:
-            for feat in available_features:
-                f.write(f"{feat}\n")
-    except Exception as e:
-        print(f"Warning: Could not write selected features to file: {e}")
+                    for category, patterns in feature_patterns.items():
+                        category_features = [f for f in available_features
+                                           if any(p in f for p in patterns if isinstance(p, str))]
+                        if category_features:
+                            f.write(f"## {category.upper()} ({len(category_features)} features)\n")
+                            for feat in sorted(category_features):
+                                f.write(f"{feat}\n")
+                            f.write("\n")
+            except Exception as e:
+                print(f"Warning: Could not save feature list: {e}")
 
-    # Safety check - ensure we actually have features
-    if not available_features:
-        print("WARNING: No features selected. Using default basic features.")
-        # Fallback to some basic features if available
-        basic_features = ['MA5', 'MA10', 'MA20', 'RSI', 'Volatility_10d']
-        available_features = [col for col in basic_features if col in df.columns]
-        if not available_features:
-            print("ERROR: No fallback features available. Returning all numeric columns.")
-            # Last resort - use all numeric columns
-            available_features = df.select_dtypes(include=['number']).columns.tolist()
-
-    # Features should already be clean from engineer_features method
-    try:
-        feature_df = df[available_features].copy()
-        feature_df = feature_df.fillna(0)
-    except Exception as e:
-        print(f"ERROR in feature selection: {e}")
-        # Return an empty DataFrame in case of error
+            return feature_df
+        except Exception as e:
+            print(f"Error creating feature DataFrame: {e}")
+            return pd.DataFrame()
+    else:
+        print("Warning: No features selected")
         return pd.DataFrame()
-
-    return feature_df
 
 def create_targets(df):
-    """Create prediction targets - FIXED to avoid look-ahead"""
-    # Safety check - ensure we have the required columns
+    """Create prediction targets with strict future-looking approach"""
+
     if df is None or len(df) == 0:
-        print("WARNING: Empty dataframe passed to create_targets. Returning empty DataFrame.")
+        print("WARNING: Empty dataframe passed to create_targets")
         return pd.DataFrame()
 
-    if 'Close' not in df.columns:
-        print("ERROR: 'Close' column not found in dataframe. Cannot create targets.")
+    if 'Close' not in df.columns or 'Open' not in df.columns:
+        print("ERROR: Required columns (Close, Open) not found")
         return df
 
-    # Target: Next day's direction (this is what we're predicting)
-    # We shift by -1 to get tomorrow's outcome, but this is the target, not a feature
-    df['Target_1d'] = (df['Close'].shift(-1) > df['Close']).astype(int)
+    df = df.copy()
 
-    # Additional targets for analysis
-    df['Target_2d'] = (df['Close'].shift(-2) > df['Close']).astype(int)
-    df['Target_strong'] = (df['Close'].shift(-1) > df['Close'] * 1.01).astype(int)
+    # FIXED: Proper future-looking targets
+    # Target: Will tomorrow's close be higher than tomorrow's open?
+    df['Target_1d'] = (df['Close'].shift(-1) > df['Open'].shift(-1)).astype(int)
 
-    # Add a comment flag to the dataframe to indicate this version has proper causality
-    df.attrs['causality_fixed'] = True
+    # Target: Will close in 2 days be higher than open in 2 days?
+    df['Target_2d'] = (df['Close'].shift(-2) > df['Open'].shift(-2)).astype(int)
+
+    # Strong move target: Will tomorrow's close be >1% higher than tomorrow's open?
+    df['Target_strong'] = (df['Close'].shift(-1) > df['Open'].shift(-1) * 1.01).astype(int)
+
+    # Additional targets for different prediction horizons
+    # Next day direction (close-to-close)
+    df['Target_direction_1d'] = (df['Close'].shift(-1) > df['Close']).astype(int)
+
+    # Multi-day targets
+    df['Target_direction_3d'] = (df['Close'].shift(-3) > df['Close']).astype(int)
+    df['Target_direction_5d'] = (df['Close'].shift(-5) > df['Close']).astype(int)
+
+    # Volatility-adjusted targets
+    returns_std = df['Close'].pct_change().rolling(20).std()
+    threshold = returns_std * 0.5  # Half of recent volatility as threshold
+
+    df['Target_significant_up'] = (df['Close'].shift(-1) > df['Close'] * (1 + threshold)).astype(int)
+    df['Target_significant_down'] = (df['Close'].shift(-1) < df['Close'] * (1 - threshold)).astype(int)
+
+    print(f"Created targets. Target distribution (Target_1d): {df['Target_1d'].value_counts().to_dict()}")
 
     return df

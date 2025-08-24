@@ -41,7 +41,6 @@ class ModelTrainer:
         # Check for class imbalance and apply appropriate measures
         class_counts = np.bincount(y_train)
         class_ratio = min(class_counts) / max(class_counts) if max(class_counts) > 0 else 0
-        print(f"Class ratio (min/max): {class_ratio:.4f}")
 
         # Create paths if needed
         os.makedirs("tesla_stock_predictor/models", exist_ok=True)
@@ -63,6 +62,10 @@ class ModelTrainer:
             position = 0
             portfolio = [capital]
 
+            # Safety check for length
+            if len(preds) <= 1:
+                return 0.0
+
             # Safely handle different types of close_prices
             for i in range(len(preds)-1):
                 if preds[i] == 1:
@@ -72,8 +75,11 @@ class ModelTrainer:
 
                 # Handle different types of close_prices
                 try:
-                    if hasattr(close_prices, 'iloc'):
-                        # DataFrame or Series
+                    if hasattr(close_prices, 'iloc') and hasattr(close_prices, 'index'):
+                        # DataFrame or Series with Index
+                        if i >= len(close_prices) or i+1 >= len(close_prices):
+                            # Skip if indices are out of bounds
+                            continue
                         price_today = close_prices.iloc[i]
                         price_tomorrow = close_prices.iloc[i+1]
                     elif isinstance(close_prices, np.ndarray):
@@ -119,11 +125,21 @@ class ModelTrainer:
                     X_cv_train, X_cv_val = X_train.iloc[train_idx], X_train.iloc[test_idx]
                     y_cv_train, y_cv_val = y_train.iloc[train_idx], y_train.iloc[test_idx]
 
-                    # Get validation prices for this fold
-                    if hasattr(close_prices_val, 'iloc'):
-                        cv_prices = close_prices_val.iloc[test_idx]
-                    else:
-                        cv_prices = close_prices_val
+                    # For CV, we need to use price data from the training dataset
+                    # We'll create a price Series with the same index as X_cv_val
+                    train_prices = pd.Series(index=X_train.index)
+
+                    # Copy the original close prices to the train_prices Series
+                    if 'Close' in X_train.columns:
+                        train_prices = X_train['Close'].copy()
+                    elif isinstance(close_prices_val, pd.Series):
+                        # Try to get prices from the validation prices that match training indices
+                        for idx in X_train.index:
+                            if idx in close_prices_val.index:
+                                train_prices[idx] = close_prices_val[idx]
+
+                    # Get just the prices for the CV test fold
+                    cv_prices = train_prices.iloc[test_idx]
 
                     model = RandomForestClassifier(
                         n_estimators=n_estimators,
@@ -140,7 +156,12 @@ class ModelTrainer:
                     preds = model.predict(X_cv_val)
 
                     # Calculate metrics
-                    fold_sharpe = sharpe_ratio(preds, y_cv_val, cv_prices)
+                    try:
+                        fold_sharpe = sharpe_ratio(preds, y_cv_val, cv_prices)
+                    except Exception as e:
+                        print(f"Warning: Sharpe calculation failed: {e}")
+                        fold_sharpe = 0  # Default value if calculation fails
+
                     from sklearn.metrics import f1_score
                     fold_f1 = f1_score(y_cv_val, preds, average='macro')
 
@@ -176,17 +197,7 @@ class ModelTrainer:
         self.models['rf'] = rf_best
 
         # Print out-of-bag score
-        if hasattr(rf_best, 'oob_score_'):
-            print(f"Random Forest OOB Score: {rf_best.oob_score_:.4f}")
-
-        # Print feature importance
-        if hasattr(rf_best, 'feature_importances_'):
-            importances = rf_best.feature_importances_
-            indices = np.argsort(importances)[::-1]
-            print("Top 10 important features (Random Forest):")
-            feature_names = X_train.columns if hasattr(X_train, 'columns') else [f"feature_{i}" for i in range(X_train.shape[1])]
-            for i in range(min(10, len(feature_names))):
-                print(f"  {feature_names[indices[i]]}: {importances[indices[i]]:.4f}")
+        # Feature importance is stored in the model but not printed
 
         # --- Gradient Boosting: Use Optuna only if not cached ---
         if 'gb' in best_params:
@@ -210,11 +221,21 @@ class ModelTrainer:
                     X_cv_train, X_cv_val = X_train.iloc[train_idx], X_train.iloc[test_idx]
                     y_cv_train, y_cv_val = y_train.iloc[train_idx], y_train.iloc[test_idx]
 
-                    # Get validation prices for this fold
-                    if hasattr(close_prices_val, 'iloc'):
-                        cv_prices = close_prices_val.iloc[test_idx]
-                    else:
-                        cv_prices = close_prices_val
+                    # For CV, we need to use price data from the training dataset
+                    # We'll create a price Series with the same index as X_cv_val
+                    train_prices = pd.Series(index=X_train.index)
+
+                    # Copy the original close prices to the train_prices Series
+                    if 'Close' in X_train.columns:
+                        train_prices = X_train['Close'].copy()
+                    elif isinstance(close_prices_val, pd.Series):
+                        # Try to get prices from the validation prices that match training indices
+                        for idx in X_train.index:
+                            if idx in close_prices_val.index:
+                                train_prices[idx] = close_prices_val[idx]
+
+                    # Get just the prices for the CV test fold
+                    cv_prices = train_prices.iloc[test_idx]
 
                     # Early stopping to prevent overfitting
                     from sklearn.model_selection import train_test_split
@@ -237,7 +258,12 @@ class ModelTrainer:
                     preds = model.predict(X_cv_val)
 
                     # Calculate metrics
-                    fold_sharpe = sharpe_ratio(preds, y_cv_val, cv_prices)
+                    try:
+                        fold_sharpe = sharpe_ratio(preds, y_cv_val, cv_prices)
+                    except Exception as e:
+                        print(f"Warning: Sharpe calculation failed: {e}")
+                        fold_sharpe = 0  # Default value if calculation fails
+
                     from sklearn.metrics import f1_score
                     fold_f1 = f1_score(y_cv_val, preds, average='macro')
 
@@ -279,7 +305,6 @@ class ModelTrainer:
         gb_params = {k: v for k, v in gb_best_params.items() if k not in ['eval_set']}
 
         # Create and fit multiple GB models with different configurations for better discrimination
-        print("Training multiple Gradient Boosting models for improved discriminative power...")
 
         # Base model with balanced parameters
         gb_params.update({
@@ -308,7 +333,7 @@ class ModelTrainer:
             gb_complex.fit(X_train_gb, y_train_gb)
             gb_models.append(("Complex", gb_complex))
         except Exception as e:
-            print(f"  Failed to train complex GB model: {e}")
+            pass  # Failed to train complex GB model
 
         # Train a model with quantile loss for different probability distribution
         try:
@@ -321,7 +346,7 @@ class ModelTrainer:
             gb_quantile.fit(X_train_gb, y_train_gb)
             gb_models.append(("Quantile", gb_quantile))
         except Exception as e:
-            print(f"  Failed to train quantile GB model: {e}")
+            pass  # Failed to train quantile GB model
 
         # Calibrate and evaluate each model
         from sklearn.metrics import brier_score_loss
@@ -347,37 +372,23 @@ class ModelTrainer:
                     # Combined score (emphasize discrimination)
                     combined_score = unique_count - (5 * brier_score)
 
-                    print(f"  GB {model_name} ({method}): Brier={brier_score:.4f}, Unique probs={unique_count}, Score={combined_score:.4f}")
-
                     calibrated_models.append((gb_calibrated, combined_score, method, model_name))
                 except Exception as e:
-                    print(f"  GB {model_name} ({method}) calibration failed: {e}")
+                    pass  # GB calibration failed
 
         # Select the best model
         if calibrated_models:
             calibrated_models.sort(key=lambda x: x[1], reverse=True)
             best_model, best_score, best_method, model_name = calibrated_models[0]
-            print(f"  Selected {model_name} GB with {best_method} calibration (Score: {best_score:.4f})")
             self.models['gb'] = best_model
         else:
             # Fallback to basic model with sigmoid calibration
-            print("  Falling back to basic GB calibration...")
             try:
                 gb_calibrated = CalibratedClassifierCV(gb_best, method='sigmoid', cv=3)
                 gb_calibrated.fit(X_val, y_val)
                 self.models['gb'] = gb_calibrated
             except Exception as e:
-                print(f"  Warning: Could not calibrate GB model: {e}")
                 self.models['gb'] = gb_best
-
-        # Print feature importance
-        if hasattr(gb_best, 'feature_importances_'):
-            importances = gb_best.feature_importances_
-            indices = np.argsort(importances)[::-1]
-            print("Top 10 important features (Gradient Boosting):")
-            feature_names = X_train.columns if hasattr(X_train, 'columns') else [f"feature_{i}" for i in range(X_train.shape[1])]
-            for i in range(min(10, len(feature_names))):
-                print(f"  {feature_names[indices[i]]}: {importances[indices[i]]:.4f}")
 
         # --- Logistic Regression: Use Optuna only if not cached ---
         if 'lr' in best_params:
@@ -409,11 +420,21 @@ class ModelTrainer:
                         X_cv_train, X_cv_val = X_train.iloc[train_idx], X_train.iloc[test_idx]
                         y_cv_train, y_cv_val = y_train.iloc[train_idx], y_train.iloc[test_idx]
 
-                        # Get validation prices for this fold
-                        if hasattr(close_prices_val, 'iloc'):
-                            cv_prices = close_prices_val.iloc[test_idx]
-                        else:
-                            cv_prices = close_prices_val
+                        # For CV, we need to use price data from the training dataset
+                        # We'll create a price Series with the same index as X_cv_val
+                        train_prices = pd.Series(index=X_train.index)
+
+                        # Copy the original close prices to the train_prices Series
+                        if 'Close' in X_train.columns:
+                            train_prices = X_train['Close'].copy()
+                        elif isinstance(close_prices_val, pd.Series):
+                            # Try to get prices from the validation prices that match training indices
+                            for idx in X_train.index:
+                                if idx in close_prices_val.index:
+                                    train_prices[idx] = close_prices_val[idx]
+
+                        # Get just the prices for the CV test fold
+                        cv_prices = train_prices.iloc[test_idx]
 
                         # Use L1/L2 regularization to prevent overfitting
                         model = LogisticRegression(
@@ -435,7 +456,12 @@ class ModelTrainer:
                             continue
 
                         # Calculate metrics
-                        fold_sharpe = sharpe_ratio(preds, y_cv_val, cv_prices)
+                        try:
+                            fold_sharpe = sharpe_ratio(preds, y_cv_val, cv_prices)
+                        except Exception as e:
+                            print(f"Warning: Sharpe calculation failed: {e}")
+                            fold_sharpe = 0  # Default value if calculation fails
+
                         from sklearn.metrics import f1_score
                         fold_f1 = f1_score(y_cv_val, preds, average='macro')
 
@@ -472,18 +498,7 @@ class ModelTrainer:
         self.models['lr'] = lr_best
 
         # Print coefficient information
-        if hasattr(lr_best, 'coef_'):
-            coef = lr_best.coef_[0]
-            # Get feature names
-            feature_names = X_train.columns if hasattr(X_train, 'columns') else [f"feature_{i}" for i in range(X_train.shape[1])]
-            # Get top 5 positive and negative coefficients
-            sorted_idx = np.argsort(coef)
-            print("Top 5 negative features (LogisticRegression):")
-            for i in range(min(5, len(sorted_idx))):
-                print(f"  {feature_names[sorted_idx[i]]}: {coef[sorted_idx[i]]:.4f}")
-            print("Top 5 positive features (LogisticRegression):")
-            for i in range(min(5, len(sorted_idx))):
-                print(f"  {feature_names[sorted_idx[-(i+1)]]}: {coef[sorted_idx[-(i+1)]]:.4f}")
+        # LogisticRegression - Feature importance is stored in the model but not printed
 
         # --- Decision Tree: Use Optuna only if not cached ---
         if 'dt' in best_params:
@@ -508,11 +523,21 @@ class ModelTrainer:
                         X_cv_train, X_cv_val = X_train.iloc[train_idx], X_train.iloc[test_idx]
                         y_cv_train, y_cv_val = y_train.iloc[train_idx], y_train.iloc[test_idx]
 
-                        # Get validation prices for this fold
-                        if hasattr(close_prices_val, 'iloc'):
-                            cv_prices = close_prices_val.iloc[test_idx]
-                        else:
-                            cv_prices = close_prices_val
+                        # For CV, we need to use price data from the training dataset
+                        # We'll create a price Series with the same index as X_cv_val
+                        train_prices = pd.Series(index=X_train.index)
+
+                        # Copy the original close prices to the train_prices Series
+                        if 'Close' in X_train.columns:
+                            train_prices = X_train['Close'].copy()
+                        elif isinstance(close_prices_val, pd.Series):
+                            # Try to get prices from the validation prices that match training indices
+                            for idx in X_train.index:
+                                if idx in close_prices_val.index:
+                                    train_prices[idx] = close_prices_val[idx]
+
+                        # Get just the prices for the CV test fold
+                        cv_prices = train_prices.iloc[test_idx]
 
                         # Cost-complexity pruning to prevent overfitting
                         model = DecisionTreeClassifier(
@@ -535,7 +560,12 @@ class ModelTrainer:
                             continue
 
                         # Calculate metrics
-                        fold_sharpe = sharpe_ratio(preds, y_cv_val, cv_prices)
+                        try:
+                            fold_sharpe = sharpe_ratio(preds, y_cv_val, cv_prices)
+                        except Exception as e:
+                            print(f"Warning: Sharpe calculation failed: {e}")
+                            fold_sharpe = 0  # Default value if calculation fails
+
                         from sklearn.metrics import f1_score
                         fold_f1 = f1_score(y_cv_val, preds, average='macro')
 
@@ -586,11 +616,7 @@ class ModelTrainer:
         dt_best = DecisionTreeClassifier(**dt_best_params, random_state=42)
         dt_best.fit(X_train, y_train)
 
-        # Print tree information
-        print(f"Decision tree depth: {dt_best.get_depth()}, leaves: {dt_best.get_n_leaves()}")
-
         # Create a calibrated tree ensemble that maintains discriminative power
-        print("Creating calibrated decision tree with improved discriminative power...")
         try:
             # Create multiple trees with different depths for better discrimination
             base_models = []
@@ -643,39 +669,24 @@ class ModelTrainer:
                         # Calculate combined score (balance calibration and discrimination)
                         combined_score = prob_entropy - (5 * brier_score)  # Favor discrimination
 
-                        print(f"  Tree {i+1} ({method}): Brier={brier_score:.4f}, Unique probs={prob_entropy}, Score={combined_score:.4f}")
-
                         calibrated_models.append((dt_calibrated, combined_score, method, i))
                     except Exception as e:
-                        print(f"  Tree {i+1} ({method}) calibration failed: {e}")
+                        pass  # Tree calibration failed
 
             # Select the model with the best combined score
             if calibrated_models:
                 # Sort by combined score (higher is better)
                 calibrated_models.sort(key=lambda x: x[1], reverse=True)
                 best_model, best_score, best_method, best_idx = calibrated_models[0]
-                print(f"  Selected tree {best_idx+1} with {best_method} calibration (Score: {best_score:.4f})")
                 self.models['dt'] = best_model
             else:
                 # Use original tree with basic calibration
-                print("  Using original tree with sigmoid calibration...")
                 dt_calibrated = CalibratedClassifierCV(dt_best, method='sigmoid', cv=3)
                 dt_calibrated.fit(X_val, y_val)
                 self.models['dt'] = dt_calibrated
         except Exception as e:
-            print(f"All calibration attempts failed for Decision Tree: {e}")
-            print("Using uncalibrated model as fallback.")
+            # Use uncalibrated model as fallback
             self.models['dt'] = dt_best
-
-        # Print feature importance
-        if hasattr(dt_best, 'feature_importances_'):
-            importances = dt_best.feature_importances_
-            indices = np.argsort(importances)[::-1]
-            print("Top 10 important features (Decision Tree):")
-            feature_names = X_train.columns if hasattr(X_train, 'columns') else [f"feature_{i}" for i in range(X_train.shape[1])]
-            for i in range(min(10, len(feature_names))):
-                if importances[indices[i]] > 0:
-                    print(f"  {feature_names[indices[i]]}: {importances[indices[i]]:.4f}")
 
         # --- LightGBM: Use Optuna only if not cached ---
         if 'lgb' in best_params:
@@ -701,11 +712,21 @@ class ModelTrainer:
                     X_cv_train, X_cv_val = X_train.iloc[train_idx], X_train.iloc[test_idx]
                     y_cv_train, y_cv_val = y_train.iloc[train_idx], y_train.iloc[test_idx]
 
-                    # Get validation prices for this fold
-                    if hasattr(close_prices_val, 'iloc'):
-                        cv_prices = close_prices_val.iloc[test_idx]
-                    else:
-                        cv_prices = close_prices_val
+                    # For CV, we need to use price data from the training dataset
+                    # We'll create a price Series with the same index as X_cv_val
+                    train_prices = pd.Series(index=X_train.index)
+
+                    # Copy the original close prices to the train_prices Series
+                    if 'Close' in X_train.columns:
+                        train_prices = X_train['Close'].copy()
+                    elif isinstance(close_prices_val, pd.Series):
+                        # Try to get prices from the validation prices that match training indices
+                        for idx in X_train.index:
+                            if idx in close_prices_val.index:
+                                train_prices[idx] = close_prices_val[idx]
+
+                    # Get just the prices for the CV test fold
+                    cv_prices = train_prices.iloc[test_idx]
 
                     # Create a validation set for early stopping
                     from sklearn.model_selection import train_test_split
@@ -737,7 +758,12 @@ class ModelTrainer:
                     preds = model.predict(X_cv_val)
 
                     # Calculate metrics
-                    fold_sharpe = sharpe_ratio(preds, y_cv_val, cv_prices)
+                    try:
+                        fold_sharpe = sharpe_ratio(preds, y_cv_val, cv_prices)
+                    except Exception as e:
+                        print(f"Warning: Sharpe calculation failed: {e}")
+                        fold_sharpe = 0  # Default value if calculation fails
+
                     from sklearn.metrics import f1_score
                     fold_f1 = f1_score(y_cv_val, preds, average='macro')
 
@@ -781,7 +807,6 @@ class ModelTrainer:
         }
 
         # Create a diverse set of LightGBM models with different configurations
-        print("Training multiple LightGBM models for improved discriminative power...")
         lgb_models = []
 
         # Train the main model
@@ -858,30 +883,18 @@ class ModelTrainer:
                     combined_score = prob_entropy - (5 * brier_score)
 
                     model_type = ["Best", "Aggressive", "Conservative"][i] if i < 3 else f"Model {i}"
-                    print(f"  LightGBM {model_type} ({method}): Brier={brier_score:.4f}, Unique probs={prob_entropy}, Score={combined_score:.4f}")
 
                     calibrated_models.append((lgb_calibrated, combined_score, method, model_type))
                 except Exception as e:
-                    print(f"  LightGBM {i} ({method}) calibration failed: {e}")
+                    pass  # LightGBM calibration failed
 
         # Select best model based on combined score
         if calibrated_models:
             calibrated_models.sort(key=lambda x: x[1], reverse=True)
             best_model, best_score, best_method, model_type = calibrated_models[0]
-            print(f"  Selected {model_type} LightGBM with {best_method} calibration (Score: {best_score:.4f})")
             self.models['lgb'] = best_model
         else:
             # Fallback to basic calibration
-            print("  Falling back to basic LightGBM calibration...")
             lgb_calibrated = CalibratedClassifierCV(lgb_best, method='sigmoid', cv=3)
             lgb_calibrated.fit(X_val, y_val)
             self.models['lgb'] = lgb_calibrated
-
-        # Print feature importance
-        if hasattr(lgb_best, 'feature_importances_'):
-            importances = lgb_best.feature_importances_
-            indices = np.argsort(importances)[::-1]
-            print("Top 10 important features (LightGBM):")
-            feature_names = X_train.columns if hasattr(X_train, 'columns') else [f"feature_{i}" for i in range(X_train.shape[1])]
-            for i in range(min(10, len(feature_names))):
-                print(f"  {feature_names[indices[i]]}: {importances[indices[i]]:.4f}")
